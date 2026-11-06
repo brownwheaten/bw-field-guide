@@ -24,9 +24,11 @@
     <div class="mark">B+W</div>
     <h1>Field Guide</h1>
     <p class="muted">Enter your passphrase once on this device.</p>
-    <form id="lockForm" autocomplete="off">
+    <form id="lockForm" action="#" method="post">
+      <label for="user" class="sr">Account</label>
+      <input id="user" name="username" type="text" autocomplete="username" value="B+W Field Guide" readonly class="sr">
       <label for="pass" class="sr">Passphrase</label>
-      <input id="pass" type="password" placeholder="Passphrase" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+      <input id="pass" name="password" type="password" autocomplete="current-password" placeholder="Passphrase" autocapitalize="none" autocorrect="off" spellcheck="false" required>
       <button class="btn primary" type="submit">Unlock</button>
     </form>
     <p id="lockMsg" class="msg" role="status"></p>
@@ -231,6 +233,6 @@
 <div id="toast" class="toast" role="status" hidden></div>
 
 <script src="vendor/leaflet.js"></script>
-<script src="app.js?v=2"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>
