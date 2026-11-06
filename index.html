@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>B+W Field Guide</title>
+<meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#2A1E16">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Field Guide">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="vendor/leaflet.css">
+<link rel="stylesheet" href="style.css?v=1">
+</head>
+<body>
+
+<!-- Lock screen -->
+<section id="lock" class="lock" hidden>
+  <div class="lock-card">
+    <div class="mark">B+W</div>
+    <h1>Field Guide</h1>
+    <p class="muted">Enter your passphrase once on this device.</p>
+    <form id="lockForm" autocomplete="off">
+      <label for="pass" class="sr">Passphrase</label>
+      <input id="pass" type="password" placeholder="Passphrase" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+      <button class="btn primary" type="submit">Unlock</button>
+    </form>
+    <p id="lockMsg" class="msg" role="status"></p>
+  </div>
+</section>
+
+<!-- App -->
+<div id="app" class="app" hidden>
+  <header class="top">
+    <div class="brand"><span class="mark sm">B+W</span><span id="topTitle">Today</span></div>
+    <div class="status">
+      <span id="gpsChip" class="chip" title="Location">GPS…</span>
+      <span id="syncChip" class="chip" title="Sync">…</span>
+    </div>
+  </header>
+
+  <main id="views">
+    <!-- TODAY -->
+    <section id="v-today" class="view">
+      <div id="whereCard" class="card where">
+        <div class="where-head">
+          <div>
+            <div class="eyebrow">Where am I</div>
+            <h2 id="whereName">Finding you…</h2>
+            <div id="whereSub" class="muted"></div>
+          </div>
+          <button id="whereRefresh" class="icon-btn" aria-label="Refresh location">⟳</button>
+        </div>
+        <div id="whereLook" class="look"></div>
+        <div id="whereCor" class="cor"></div>
+        <div id="whereNear" class="near"></div>
+      </div>
+
+      <div class="card">
+        <div class="row between">
+          <div class="eyebrow">Today's plan</div>
+          <button id="pickWalkBtn" class="link">Change</button>
+        </div>
+        <div id="planBox"></div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Carry</div>
+        <ul id="carryList" class="checks"></ul>
+        <p class="rules">Business names yes. People's names never: role only. Paraphrase quotes unless they knew they might be quoted. No photos of faces.</p>
+      </div>
+    </section>
+
+    <!-- MAP -->
+    <section id="v-map" class="view mapview" hidden>
+      <div id="map"></div>
+      <div class="map-tools">
+        <button id="locateBtn" class="fab-sm" aria-label="Center on me">◎</button>
+        <button id="layersBtn" class="fab-sm" aria-label="Layers">≡</button>
+      </div>
+      <div id="layersPanel" class="layers" hidden>
+        <label><input type="checkbox" data-layer="walks" checked> Walks</label>
+        <label><input type="checkbox" data-layer="biz" checked> Borrower businesses</label>
+        <label><input type="checkbox" data-layer="cor" checked> Districts / corridors</label>
+        <label><input type="checkbox" data-layer="lens" checked> What to look for</label>
+        <label><input type="checkbox" data-layer="terr"> Walk / drive zones</label>
+        <label><input type="checkbox" data-layer="caps" checked> My captures</label>
+      </div>
+    </section>
+
+    <!-- LOG -->
+    <section id="v-log" class="view" hidden>
+      <div class="card">
+        <div class="row between"><div class="eyebrow">Today</div><span id="logCount" class="muted"></span></div>
+        <div id="daySummary" class="summary"></div>
+        <button id="endDayBtn" class="btn">End day</button>
+        <p id="endDayMsg" class="msg" role="status"></p>
+      </div>
+      <div id="logList" class="list"></div>
+    </section>
+
+    <!-- FOLLOW-UPS -->
+    <section id="v-fu" class="view" hidden>
+      <div class="card"><div class="eyebrow">Follow-ups</div><p class="muted">Everything you flagged in the field. Claude drafts the emails the next morning; tick one off when it's handled.</p></div>
+      <div id="fuList" class="list"></div>
+    </section>
+
+    <!-- MORE -->
+    <section id="v-more" class="view" hidden>
+      <div class="card">
+        <div class="eyebrow">Find a business</div>
+        <input id="bizSearch" type="search" placeholder="Name, street or town">
+        <div id="bizResults" class="list tight"></div>
+      </div>
+      <div class="card">
+        <div class="eyebrow">Connections</div>
+        <div id="connStatus" class="muted">Checking…</div>
+        <label for="scriptUrl" class="lbl">Backend URL</label>
+        <input id="scriptUrl" type="url" placeholder="https://script.google.com/macros/s/…/exec">
+        <button id="saveUrl" class="btn">Save</button>
+      </div>
+      <div class="card">
+        <div class="eyebrow">This device</div>
+        <p id="devInfo" class="muted"></p>
+        <button id="syncNow" class="btn">Send waiting captures now</button>
+        <button id="lockNow" class="btn ghost">Lock this device</button>
+      </div>
+    </section>
+  </main>
+
+  <button id="captureFab" class="fab" aria-label="Capture">＋</button>
+
+  <nav class="tabs">
+    <button data-v="today" class="on">Today</button>
+    <button data-v="map">Map</button>
+    <button data-v="log">Log</button>
+    <button data-v="fu">Follow-ups <span id="fuBadge" class="badge" hidden></span></button>
+    <button data-v="more">More</button>
+  </nav>
+</div>
+
+<!-- Capture sheet -->
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+    <div class="row between">
+      <h2 id="sheetTitle">Capture</h2>
+      <button class="icon-btn" data-close aria-label="Close">✕</button>
+    </div>
+    <div id="capWhere" class="muted small"></div>
+
+    <div class="seg" id="kindSeg">
+      <button data-kind="note" class="on">Note</button>
+      <button data-kind="photo">Photo</button>
+      <button data-kind="voice">Voice</button>
+      <button data-kind="talk">Talked</button>
+      <button data-kind="dropoff">Dropped</button>
+    </div>
+
+    <label class="lbl" for="capBiz">Business</label>
+    <select id="capBiz"></select>
+    <input id="capBizOther" type="text" placeholder="Or type a business name / address" hidden>
+
+    <div data-for="photo" hidden>
+      <label class="btn wide" for="capPhoto">Take or choose a photo</label>
+      <input id="capPhoto" type="file" accept="image/*" capture="environment" hidden>
+      <img id="capPhotoPrev" class="prev" alt="" hidden>
+    </div>
+
+    <div data-for="voice" hidden>
+      <button id="recBtn" class="btn wide rec">● Record</button>
+      <audio id="recPrev" controls hidden></audio>
+      <p class="muted small">Up to 3 minutes. Saved as audio to your Drive. Tip: say the business and street first.</p>
+    </div>
+
+    <div data-for="talk" hidden>
+      <div class="lbl">Who</div>
+      <div class="chips" id="roleChips" data-single>
+        <button data-v="Owner">Owner</button><button data-v="Manager or staff">Manager / staff</button><button data-v="Resident">Resident</button>
+      </div>
+    </div>
+
+    <label class="lbl" for="capText">Note <span class="muted small">(tap the mic on the keyboard to dictate)</span></label>
+    <textarea id="capText" rows="3" placeholder="What you noticed, or what they said (paraphrased)"></textarea>
+
+    <div data-for="note photo talk">
+      <div class="lbl">What I saw</div>
+      <div class="chips" id="sawChips">
+        <button data-v="Open">Open</button><button data-v="Closed">Closed</button><button data-v="New">New</button><button data-v="For lease">For lease</button>
+        <button data-v="Under renovation">Renovation</button><button data-v="Busy">Busy</button><button data-v="Empty">Empty</button><button data-v="Hiring sign">Hiring sign</button>
+      </div>
+    </div>
+
+    <div data-for="talk dropoff">
+      <div class="lbl">Handed over</div>
+      <div class="chips" id="handChips">
+        <button data-v="Card">Card</button><button data-v="Leave-behind">Leave-behind</button><button data-v="Tapped NFC card">Tapped card</button><button data-v="Showed QR">Showed QR</button><button data-v="Nothing">Nothing</button>
+      </div>
+    </div>
+
+    <div class="lbl">Follow up</div>
+    <div class="chips" id="fuChips" data-single>
+      <button data-v="none" class="on">No</button><button data-v="email">Email</button><button data-v="stopback">Stop back</button><button data-v="sample">Send a sample</button>
+    </div>
+    <input id="capContact" type="text" placeholder="Business email or how to reach them (only what they offered)" hidden>
+
+    <button id="capSave" class="btn primary wide">Save</button>
+    <p id="capMsg" class="msg" role="status"></p>
+  </div>
+</div>
+
+<!-- Business / info sheet -->
+<div id="info" class="sheet" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true">
+    <div class="row between"><h2 id="infoTitle"></h2><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+    <div id="infoBody"></div>
+  </div>
+</div>
+
+<!-- Walk picker -->
+<div id="picker" class="sheet" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true">
+    <div class="row between"><h2>Pick today's walk or drive</h2><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+    <div id="pickList" class="list tight"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<script src="vendor/leaflet.js"></script>
+<script src="app.js?v=1"></script>
+</body>
+</html>
