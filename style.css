@@ -136,3 +136,14 @@ audio{width:100%;margin-top:8px}
 .me-dot{width:18px;height:18px;border-radius:50%;background:#1a73e8;border:3px solid #fff;box-shadow:0 0 0 2px rgba(26,115,232,.35)}
 @media (min-width:900px){.view{max-width:820px}}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+
+.cardbtn{border:0;cursor:pointer;background:var(--ink);color:var(--onInk)}
+.btn.danger{color:var(--bad)}
+.cardview{position:fixed;inset:0;z-index:70;background:#F2EBDC;display:grid;place-items:center;padding:24px}
+.cardinner{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;color:#2A1E16}
+.cardinner img{width:min(78vw,340px);height:auto;background:#fff;padding:14px;border-radius:6px;image-rendering:pixelated}
+.cardurl{font-family:var(--serif);font-size:1.6rem;color:#2A1E16}
+.cardinner .muted{color:rgba(42,30,22,.7)}
+.capactions{display:flex;gap:8px}
+.capactions button{background:none;border:0;color:var(--sienna);font-weight:700;padding:4px 0}
+.stopnum{width:26px;height:26px;border-radius:50%;background:#2A1E16;color:#F2EBDC;border:2px solid #fff;display:grid;place-items:center;font:700 13px/1 sans-serif}

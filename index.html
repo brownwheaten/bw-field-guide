@@ -14,7 +14,7 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="stylesheet" href="vendor/leaflet.css">
-<link rel="stylesheet" href="style.css?v=1">
+<link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
 
@@ -42,6 +42,7 @@
     <div class="status">
       <span id="gpsChip" class="chip" title="Location">GPS…</span>
       <span id="syncChip" class="chip" title="Sync">…</span>
+      <button id="cardBtn" class="chip cardbtn" aria-label="Show my card">My card</button>
     </div>
   </header>
 
@@ -60,6 +61,7 @@
         <div id="whereLook" class="look"></div>
         <div id="whereCor" class="cor"></div>
         <div id="whereNear" class="near"></div>
+        <div id="whereShops" class="near"></div>
       </div>
 
       <div class="card">
@@ -86,7 +88,9 @@
       </div>
       <div id="layersPanel" class="layers" hidden>
         <label><input type="checkbox" data-layer="walks" checked> Walks</label>
+        <label><input type="checkbox" data-layer="plan" checked> Today's stops</label>
         <label><input type="checkbox" data-layer="biz" checked> Borrower businesses</label>
+        <label><input type="checkbox" data-layer="pois" checked> Storefronts (zoom in)</label>
         <label><input type="checkbox" data-layer="cor" checked> Districts / corridors</label>
         <label><input type="checkbox" data-layer="lens" checked> What to look for</label>
         <label><input type="checkbox" data-layer="terr"> Walk / drive zones</label>
@@ -114,8 +118,8 @@
     <!-- MORE -->
     <section id="v-more" class="view" hidden>
       <div class="card">
-        <div class="eyebrow">Find a business</div>
-        <input id="bizSearch" type="search" placeholder="Name, street or town">
+        <div class="eyebrow">Search</div>
+        <input id="bizSearch" type="search" placeholder="Business, street, town or neighborhood">
         <div id="bizResults" class="list tight"></div>
       </div>
       <div class="card">
@@ -230,9 +234,38 @@
   </div>
 </div>
 
+<!-- Edit capture -->
+<div id="editor" class="sheet" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="edTitle">
+    <div class="row between"><h2 id="edTitle">Edit capture</h2><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+    <label class="lbl" for="edBiz">Business</label>
+    <input id="edBiz" type="text">
+    <label class="lbl" for="edText">Note</label>
+    <textarea id="edText" rows="4"></textarea>
+    <div class="lbl">Follow up</div>
+    <div class="chips" id="edFu" data-single>
+      <button data-v="none">No</button><button data-v="email">Email</button><button data-v="stopback">Stop back</button><button data-v="sample">Send a sample</button>
+    </div>
+    <input id="edContact" type="text" placeholder="Contact (only what they offered)">
+    <button id="edSave" class="btn primary wide">Save changes</button>
+    <button id="edDelete" class="btn ghost wide danger">Delete this capture</button>
+    <p id="edMsg" class="msg" role="status"></p>
+  </div>
+</div>
+
+<!-- My card -->
+<div id="cardView" class="cardview" hidden>
+  <div class="cardinner">
+    <div class="muted">Darryl Wooten · Brown + Wheaten</div>
+    <img src="card-qr.png" alt="QR code for bwimpact.org/hello" width="300" height="300">
+    <div class="cardurl">bwimpact.org/hello</div>
+    <div class="muted small">Point your camera here. Tap anywhere to close.</div>
+  </div>
+</div>
+
 <div id="toast" class="toast" role="status" hidden></div>
 
 <script src="vendor/leaflet.js"></script>
-<script src="app.js?v=3"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>

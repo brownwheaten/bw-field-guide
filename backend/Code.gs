@@ -44,6 +44,9 @@ const ACTIONS = {
   setFollowup: (d) => setFollowup_(d),
   apollo: (d) => apollo_(d),
   hubspot: (d) => hubspot_(d),
+  pois: (d) => pois_(d),
+  updateCapture: (d) => updateCapture_(d),
+  deleteCapture: (d) => deleteCapture_(d),
 };
 
 // ---------- helpers ----------
@@ -166,6 +169,29 @@ function setFollowup_(d) {
   bq_('UPDATE ' + T('field_captures') + ' SET followup_done = @v, followup_done_ts = IF(@v, CURRENT_TIMESTAMP(), NULL) WHERE id = @id',
     [p_('v', 'BOOL', !!d.done), p_('id', 'STRING', d.id)]);
   return { id: d.id, done: !!d.done };
+}
+
+// ---------- storefronts (OSM) ----------
+// Tiles are 0.02 x 0.02 degrees; x = floor(lon/0.02), y = floor(lat/0.02).
+function pois_(d) {
+  const S = 0.02, x = Number(d.x), y = Number(d.y);
+  const rows = bq_('SELECT osm_id, lat, lon, name, cat, addr, city, website, hours FROM ' + T('fg_osm_pois') +
+    ' WHERE lon >= @x0 AND lon < @x1 AND lat >= @y0 AND lat < @y1 AND name IS NOT NULL LIMIT 3000',
+    [p_('x0', 'FLOAT64', x * S), p_('x1', 'FLOAT64', (x + 1) * S), p_('y0', 'FLOAT64', y * S), p_('y1', 'FLOAT64', (y + 1) * S)]);
+  return { x: x, y: y, pois: rows.map(r => [String(r.osm_id), r.lat, r.lon, r.name, r.cat, r.addr || '', r.city || '', r.website || '', r.hours || '']) };
+}
+
+// ---------- edit / delete ----------
+function updateCapture_(d) {
+  bq_('UPDATE ' + T('field_captures') + ' SET text = @text, followup = @fu, contact = @contact, business_name = IFNULL(@bname, business_name) WHERE id = @id',
+    [p_('text', 'STRING', d.text), p_('fu', 'STRING', d.followup || 'none'), p_('contact', 'STRING', d.contact), p_('bname', 'STRING', d.business_name), p_('id', 'STRING', d.id)]);
+  return { id: d.id, updated: true };
+}
+function deleteCapture_(d) {
+  const rows = bq_('SELECT media_drive_id FROM ' + T('field_captures') + ' WHERE id = @id', [p_('id', 'STRING', d.id)]);
+  rows.forEach(r => { if (r.media_drive_id) { try { DriveApp.getFileById(r.media_drive_id).setTrashed(true); } catch (e) { } } });
+  bq_('DELETE FROM ' + T('field_captures') + ' WHERE id = @id', [p_('id', 'STRING', d.id)]);
+  return { id: d.id, deleted: true };
 }
 
 // ---------- Apollo ----------
