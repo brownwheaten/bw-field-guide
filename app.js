@@ -4,7 +4,7 @@
    Storefronts come from the backend in 0.02° tiles (OSM via BigQuery) and are cached on the device.
    Captures and plans live in BigQuery via the Apps Script backend; captures wait in IndexedDB until sent. */
 'use strict';
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.2.0';
 const TZ = 'America/New_York';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -694,25 +694,59 @@ function drawCaps() {
 }
 
 // ---------------- search ----------------
+// Local matches show instantly (borrowers, areas, storefronts already on the phone);
+// then the backend searches every storefront in the territory, nearest first.
+let searchTok = 0, searchTimer = null;
 function search(q) {
-  q = q.trim().toLowerCase();
+  q = q.trim();
+  const tok = ++searchTok;
+  clearTimeout(searchTimer);
   if (q.length < 2) { $('#bizResults').innerHTML = ''; return; }
-  const has = (s) => String(s || '').toLowerCase().includes(q);
-  const biz = S.ref.biz.filter(b => has(b.name + ' ' + b.address + ' ' + b.city + ' ' + b.ref)).slice(0, 15);
-  const shops = [...S.pois.values()].filter(p => has(p.name + ' ' + p.addr + ' ' + p.cat)).slice(0, 15);
+  renderSearch(q, tok, S.cfg.url && S.online ? 'loading' : 'offline');
+  if (S.cfg.url && S.online) searchTimer = setTimeout(async () => {
+    try {
+      const pos = S.pos || {};
+      const r = await api('searchPois', { q, lat: pos.lat ?? null, lon: pos.lon ?? null }, 20000);
+      if (tok !== searchTok) return;
+      addPois(r.pois || []);
+      S._remoteIds = new Set((r.pois || []).map(a => 'osm:' + a[0]));
+      renderSearch(q, tok, 'done');
+    } catch (e) { if (tok === searchTok) renderSearch(q, tok, 'error'); }
+  }, 350);
+}
+function renderSearch(q, tok, state) {
+  if (tok !== searchTok) return;
+  const ql = q.toLowerCase(), words = ql.replace(/['’]/g, '').split(/\s+/).filter(w => w.length >= 2);
+  const hasAll = (s) => { s = String(s || '').toLowerCase().replace(/['’]/g, ''); return words.every(w => s.includes(w)); };
+  const dist = (lat, lon) => S.pos ? meters(S.pos.lat, S.pos.lon, lat, lon) : null;
+  const byDist = (a, b) => (a.d ?? 1e12) - (b.d ?? 1e12);
+  const biz = S.ref.biz.filter(b => hasAll([b.name, b.address, b.city, b.ref].join(' ')))
+    .map(b => ({ b, d: dist(b.lat, b.lon) })).sort(byDist).slice(0, 10);
+  const remote = state === 'done' ? (S._remoteIds || new Set()) : new Set();
+  const shops = [...S.pois.values()].filter(p => remote.has(p.id) || hasAll([p.name, p.addr, p.city, p.cat, CAT(p.cat)].join(' ')))
+    .map(p => ({ p, d: dist(p.lat, p.lon) })).sort(byDist).slice(0, 30);
   const areas = [];
-  S.ref.cor.forEach(c => has(c.name + ' ' + c.org) && areas.push({ id: c.id, name: c.name, sub: c.org || 'District / corridor', g: c.g }));
-  S.ref.lens.forEach(t => has(t.place) && areas.push({ id: t.id, name: t.place, sub: t.t1, g: t.g }));
-  S.ref.walks.forEach(w => has(w.name) && areas.push({ id: 'walk:' + w.walk, name: w.walk + '. ' + w.name, sub: 'Walk', g: w.g }));
-  S._areaHits = areas.slice(0, 12);
-  $('#bizResults').innerHTML =
-    (S._areaHits.length ? `<div class="eyebrow" style="margin-top:8px">Areas</div>` + S._areaHits.map((a, i) => `<div class="item" data-area="${i}"><span class="txt"><b>${esc(a.name)}</b><div><small>${esc(a.sub)}</small></div></span><span class="pill">Map</span></div>`).join('') : '')
-    + (biz.length ? `<div class="eyebrow" style="margin-top:8px">Borrower businesses</div>` + biz.map(b => `<div class="item" data-biz="${esc(b.ref)}"><span class="txt"><b>${esc(b.name)}</b><div><small>${esc(b.address)}, ${esc(b.city)} ${esc(b.state)}</small></div></span>${mailPill(b)}</div>`).join('') : '')
-    + (shops.length ? `<div class="eyebrow" style="margin-top:8px">Storefronts saved on this device</div>` + shops.map(p => `<div class="item" data-poi="${esc(p.id)}"><span class="txt"><b>${esc(p.name)}</b><div><small>${esc(CAT(p.cat))}${p.addr ? ' · ' + esc(p.addr) : ''}</small></div></span></div>`).join('') : '')
-    || '<p class="muted small">Nothing matches. Areas and storefronts load as you move around; for any other business, use ＋ and type its name.</p>';
+  S.ref.cor.forEach(c => hasAll(c.name + ' ' + c.org) && areas.push({ id: c.id, name: c.name, sub: c.org || 'District / corridor', g: c.g }));
+  S.ref.lens.forEach(t => hasAll(t.place) && areas.push({ id: t.id, name: t.place, sub: t.t1 || 'Neighborhood', g: t.g }));
+  S.ref.walks.forEach(w => hasAll(w.name) && areas.push({ id: 'walk:' + w.walk, name: w.walk + '. ' + w.name, sub: 'Walk', g: w.g }));
+  const seenA = new Set();
+  S._areaHits = areas.filter(a => !seenA.has(a.name) && seenA.add(a.name)).slice(0, 8);
+  const dtxt = (d) => d == null ? '' : ' · ' + fmtDist(d);
+  const status = state === 'loading' ? '<p class="muted small">Searching all storefronts…</p>'
+    : state === 'offline' ? '<p class="muted small">Offline: showing only what\'s saved on this phone.</p>'
+    : state === 'error' ? '<p class="muted small">Couldn\'t reach the full storefront list. Showing what\'s on this phone.</p>' : '';
+  const html =
+    (shops.length ? `<div class="eyebrow" style="margin-top:8px">Storefronts${S.pos ? ', nearest first' : ''}</div>` + shops.map(s => `<div class="item" data-poi="${esc(s.p.id)}"><span class="txt"><b>${esc(s.p.name)}</b><div><small>${esc(CAT(s.p.cat))}${s.p.addr ? ' · ' + esc(s.p.addr) : ''}${s.p.city ? ', ' + esc(s.p.city) : ''}${dtxt(s.d)}</small></div></span><span class="pill" data-mapto="${esc(s.p.id)}">Map</span></div>`).join('') : '')
+    + (biz.length ? `<div class="eyebrow" style="margin-top:8px">Borrower businesses</div>` + biz.map(x => `<div class="item" data-biz="${esc(x.b.ref)}"><span class="txt"><b>${esc(x.b.name)}</b><div><small>${esc(x.b.address)}, ${esc(x.b.city)} ${esc(x.b.state)}${dtxt(x.d)}</small></div></span>${mailPill(x.b)}</div>`).join('') : '')
+    + (S._areaHits.length ? `<div class="eyebrow" style="margin-top:8px">Areas</div>` + S._areaHits.map((a, i) => `<div class="item" data-area="${i}"><span class="txt"><b>${esc(a.name)}</b><div><small>${esc(a.sub)}</small></div></span><span class="pill">Map</span></div>`).join('') : '');
+  $('#bizResults').innerHTML = status + (html || (state === 'loading' ? '' : '<p class="muted small">Nothing matches. Try one word from the name, or the street. For anything not listed, use ＋ and type it in.</p>'));
   $$('#bizResults [data-area]').forEach(el => el.onclick = () => {
     const a = S._areaHits[+el.dataset.area]; switchView('map');
     setTimeout(() => { const bb = bboxOf(a.g); S.map.fitBounds([[bb[1], bb[0]], [bb[3], bb[2]]], { padding: [30, 30], maxZoom: 16 }); }, 200);
+  });
+  $$('#bizResults [data-mapto]').forEach(el => el.onclick = (e) => {
+    e.stopPropagation(); const p = S.pois.get(el.dataset.mapto); if (!p) return;
+    switchView('map'); setTimeout(() => { S.map.setView([p.lat, p.lon], 18); }, 200);
   });
 }
 
@@ -767,6 +801,7 @@ function bindUI() {
   $('#locateBtn').onclick = () => { if (S.pos && S.map) S.map.setView([S.pos.lat, S.pos.lon], 17); else startGps(); };
   $('#layersBtn').onclick = () => $('#layersPanel').hidden = !$('#layersPanel').hidden;
   $('#bizSearch').oninput = e => search(e.target.value);
+  $('#bizSearch').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); search(e.target.value); } };
   $('#scriptUrl').value = S.cfg.url || '';
   $('#saveUrl').onclick = () => { S.cfg.url = $('#scriptUrl').value.trim(); ls.set('cfg', JSON.stringify(S.cfg)); checkBackend(); syncSoon(200); loadPlan(); };
   $('#syncNow').onclick = () => sync();

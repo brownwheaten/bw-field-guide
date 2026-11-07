@@ -14,7 +14,7 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="stylesheet" href="vendor/leaflet.css">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 
@@ -49,6 +49,10 @@
   <main id="views">
     <!-- TODAY -->
     <section id="v-today" class="view">
+      <div class="card search">
+        <input id="bizSearch" type="search" placeholder="Search: a business, street or type (e.g. coffee)" autocomplete="off" autocapitalize="none" enterkeyhint="search" aria-label="Search businesses">
+        <div id="bizResults" class="list tight"></div>
+      </div>
       <div id="whereCard" class="card where">
         <div class="where-head">
           <div>
@@ -117,11 +121,6 @@
 
     <!-- MORE -->
     <section id="v-more" class="view" hidden>
-      <div class="card">
-        <div class="eyebrow">Search</div>
-        <input id="bizSearch" type="search" placeholder="Business, street, town or neighborhood">
-        <div id="bizResults" class="list tight"></div>
-      </div>
       <div class="card">
         <div class="eyebrow">Connections</div>
         <div id="connStatus" class="muted">Checking…</div>
@@ -266,6 +265,6 @@
 <div id="toast" class="toast" role="status" hidden></div>
 
 <script src="vendor/leaflet.js"></script>
-<script src="app.js?v=5"></script>
+<script src="app.js?v=6"></script>
 </body>
 </html>

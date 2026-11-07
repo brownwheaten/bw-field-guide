@@ -147,3 +147,8 @@ audio{width:100%;margin-top:8px}
 .capactions{display:flex;gap:8px}
 .capactions button{background:none;border:0;color:var(--sienna);font-weight:700;padding:4px 0}
 .stopnum{width:26px;height:26px;border-radius:50%;background:#2A1E16;color:#F2EBDC;border:2px solid #fff;display:grid;place-items:center;font:700 13px/1 sans-serif}
+
+/* search on Today */
+.card.search{padding:10px 12px}
+.card.search input{width:100%;font-size:16px}
+.card.search .list:empty{display:none}

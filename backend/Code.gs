@@ -45,6 +45,7 @@ const ACTIONS = {
   apollo: (d) => apollo_(d),
   hubspot: (d) => hubspot_(d),
   pois: (d) => pois_(d),
+  searchPois: (d) => searchPois_(d),
   updateCapture: (d) => updateCapture_(d),
   deleteCapture: (d) => deleteCapture_(d),
 };
@@ -179,6 +180,38 @@ function pois_(d) {
     ' WHERE lon >= @x0 AND lon < @x1 AND lat >= @y0 AND lat < @y1 AND name IS NOT NULL LIMIT 3000',
     [p_('x0', 'FLOAT64', x * S), p_('x1', 'FLOAT64', (x + 1) * S), p_('y0', 'FLOAT64', y * S), p_('y1', 'FLOAT64', (y + 1) * S)]);
   return { x: x, y: y, pois: rows.map(r => [String(r.osm_id), r.lat, r.lon, r.name, r.cat, r.addr || '', r.city || '', r.website || '', r.hours || '']) };
+}
+
+// Search storefronts anywhere in the territory by name, address, city or type, nearest first.
+function searchPois_(d) {
+  const q = String(d.q || '').trim().toLowerCase().replace(/[\\%_]/g, ' ').slice(0, 60);
+  if (q.length < 2) return { pois: [] };
+  const words = q.replace(/['’]/g, '').split(/\s+/).filter(w => w.length >= 2).slice(0, 4);
+  if (!words.length) return { pois: [] };
+  const hasPos = d.lat != null && d.lon != null && d.lat !== '' && isFinite(Number(d.lat)) && isFinite(Number(d.lon));
+  // everyday words → OpenStreetMap type names
+  const SYN = { coffee: ['cafe'], barber: ['hairdresser'], barbershop: ['hairdresser'], salon: ['hairdresser', 'beauty'], nails: ['beauty'],
+    laundromat: ['laundry'], bodega: ['convenience'], corner: ['convenience'], grocery: ['supermarket', 'convenience', 'greengrocer'],
+    grocer: ['supermarket', 'convenience', 'greengrocer'], gym: ['fitness'], church: ['place_of_worship'], mosque: ['place_of_worship'],
+    doctor: ['doctors', 'clinic'], auto: ['car_repair', 'car'], mechanic: ['car_repair'], liquor: ['alcohol'], deli: ['deli', 'sandwich'],
+    daycare: ['childcare', 'kindergarten'], pharmacy: ['pharmacy', 'chemist'], drugstore: ['pharmacy', 'chemist'], food: ['restaurant', 'fast_food'] };
+  const params = [];
+  const conds = words.map((w, i) => {
+    const alts = [w].concat(SYN[w] || []);
+    return '(' + alts.map((a, j) => {
+      const n = '@w' + i + '_' + j; params.push(p_(n.slice(1), 'STRING', '%' + a + '%'));
+      return 'LOWER(name) LIKE ' + n + ' OR LOWER(IFNULL(addr, "")) LIKE ' + n + ' OR LOWER(IFNULL(city, "")) LIKE ' + n + ' OR LOWER(IFNULL(cat, "")) LIKE ' + n;
+    }).join(' OR ') + ')';
+  });
+  let dist = 'NULL';
+  if (hasPos) {
+    dist = 'ST_DISTANCE(ST_GEOGPOINT(lon, lat), ST_GEOGPOINT(@lon, @lat))';
+    params.push(p_('lat', 'FLOAT64', Number(d.lat)), p_('lon', 'FLOAT64', Number(d.lon)));
+  }
+  const rows = bq_('SELECT osm_id, lat, lon, name, cat, addr, city, website, hours, ' + dist + ' AS d FROM ' + T('fg_osm_pois') +
+    ' WHERE name IS NOT NULL AND ' + conds.join(' AND ') +
+    ' ORDER BY ' + (hasPos ? 'd' : 'name') + ' LIMIT 40', params);
+  return { pois: rows.map(r => [String(r.osm_id), r.lat, r.lon, r.name, r.cat, r.addr || '', r.city || '', r.website || '', r.hours || '']) };
 }
 
 // ---------- edit / delete ----------
