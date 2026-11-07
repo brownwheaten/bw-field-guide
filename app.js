@@ -4,7 +4,7 @@
    Storefronts come from the backend in 0.02° tiles (OSM via BigQuery) and are cached on the device.
    Captures and plans live in BigQuery via the Apps Script backend; captures wait in IndexedDB until sent. */
 'use strict';
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 const TZ = 'America/New_York';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -485,7 +485,7 @@ async function loadCaptures() {
 }
 
 // ---------------- log, follow-ups, edit ----------------
-const KIND = { note: 'Note', photo: 'Photo', voice: 'Voice', talk: 'Talked', dropoff: 'Dropped', endday: 'Day wrap' };
+const KIND = { note: 'Note', photo: 'Photo', voice: 'Voice', talk: 'Talked', dropoff: 'Dropped', endday: 'Day wrap', inbound: 'Inbound lead' };
 function capCard(c, pending) {
   const t = new Date(c.ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: TZ });
   const extra = [c.role, (c.saw || []).join(', '), (c.handed || []).length ? 'Handed: ' + c.handed.join(', ') : '', c.followup && c.followup !== 'none' ? 'Follow up: ' + c.followup : ''].filter(Boolean).join(' · ');

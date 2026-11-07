@@ -283,6 +283,57 @@ function hubspot_(d) {
   return { configured: true, company_id: id, created: created };
 }
 
+// ---------- inbound leads from Gmail (phone voicemails, website form, website chat) ----------
+// Runs every 15 minutes (installInboundTrigger, once). Files each new lead email as a Field Guide
+// capture (kind "inbound", follow-up "email") so it shows in Follow-ups and the morning drafts.
+// Gmail labels come from DW's filters: Inbound/Phone (Google Voice), Inbound/Website (Squarespace form),
+// Inbound/Chat (HubSpot chat notifications). Each email is filed once (id = gm:<message id>).
+function pullInbound() {
+  const filed = GmailApp.getUserLabelByName('FG-filed') || GmailApp.createLabel('FG-filed');
+  const q = '(label:Inbound/Phone OR label:Inbound/Website OR label:Inbound/Chat) -label:FG-filed newer_than:14d';
+  const threads = GmailApp.search(q, 0, 40);
+  let n = 0;
+  threads.forEach(th => {
+    const labels = th.getLabels().map(l => l.getName());
+    const channel = labels.indexOf('Inbound/Phone') > -1 ? 'Phone' : labels.indexOf('Inbound/Chat') > -1 ? 'Website chat' : 'Website form';
+    th.getMessages().forEach(m => {
+      const body = String(m.getPlainBody() || '')
+        .replace(/\r/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .split(/\n(?:YOUR ACCOUNT|HELP CENTER|Google LLC|To unsubscribe|You received this|Sent via form submission)/i)[0]
+        .trim().slice(0, 1800);
+      const subj = m.getSubject() || '';
+      const phone = ((subj + ' ' + body).match(/\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}/) || [''])[0];
+      const replyTo = m.getReplyTo && m.getReplyTo();
+      const email = (replyTo && replyTo.indexOf('@') > -1 && !/noreply|no-reply|squarespace|google\.com|hubspot/i.test(replyTo)) ? replyTo
+        : ((body.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [''])[0]);
+      const org = ((body.match(/(?:Organization(?: Name)?|Company|Business)\s*[:\n]\s*(.+)/i) || [])[1] || '').trim().slice(0, 120);
+      const d = m.getDate();
+      saveCapture_({
+        id: 'gm:' + m.getId(),
+        ts: d.toISOString(),
+        local_date: Utilities.formatDate(d, 'America/New_York', 'yyyy-MM-dd'),
+        kind: 'inbound',
+        mode: channel,
+        business_name: org || null,
+        text: channel + ': ' + subj + '\n\n' + body,
+        followup: 'email',
+        contact: [email, phone].filter(Boolean).join(' · ') || null,
+        device: 'gmail'
+      });
+      n++;
+    });
+    th.addLabel(filed);
+  });
+  return { filed: n };
+}
+// Run once from the editor to schedule pullInbound every 15 minutes (asks for Gmail permission the first time).
+function installInboundTrigger() {
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'pullInbound').forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('pullInbound').timeBased().everyMinutes(15).create();
+  return pullInbound();
+}
+
 // Run once from the editor (Run → authorize) to grant BigQuery, Drive, Sheets and external-request access.
 function authorize() {
   Logger.log(bq_('SELECT COUNT(*) n FROM ' + T('field_captures'), []));
