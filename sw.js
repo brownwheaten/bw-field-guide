@@ -1,6 +1,6 @@
 // B+W Field Guide service worker: app shell offline, area tiles and map tiles cached as you go, backend always live.
-const V = 'bwfg-v1.4.0';
-const SHELL = ['./', 'index.html', 'style.css?v=5', 'app.js?v=9', 'data.enc', 'manifest.webmanifest', 'icon-192.png', 'icon-180.png', 'card-qr.png',
+const V = 'bwfg-v1.5.0';
+const SHELL = ['./', 'index.html', 'style.css?v=6', 'app.js?v=10', 'data.enc', 'manifest.webmanifest', 'icon-192.png', 'icon-180.png', 'card-qr.png',
   'vendor/leaflet.css', 'vendor/leaflet.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => ![V, 'tiles', 'areas'].includes(k)).map(k => caches.delete(k)))).then(() => self.clients.claim())); });

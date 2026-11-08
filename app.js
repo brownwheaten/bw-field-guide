@@ -4,7 +4,7 @@
    Storefronts come from the backend in 0.02° tiles (OSM via BigQuery) and are cached on the device.
    Captures and plans live in BigQuery via the Apps Script backend; captures wait in IndexedDB until sent. */
 'use strict';
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const TZ = 'America/New_York';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -266,6 +266,7 @@ function renderPlan() {
     box.innerHTML = `<p class="muted">No plan for today yet. Pick a walk or drive, or ask Claude to set one up.</p><button class="btn wide" id="pickWalk2">Pick a walk</button>`;
     $('#pickWalk2').onclick = openPicker; renderCarry(); drawPlan(); return;
   }
+  if (p.field || fwWalk(p.walk)) { renderFieldPlan(p); renderCarry(p.carry); drawPlan(); return; }
   const w = p.walk ? walkById(p.walk) : null;
   const stops = (p.stops || []).map((s, i) => `<li><b>${esc(s.name)}</b>${s.why ? ' — ' + esc(s.why) : ''}${s.address ? `<br><small class="muted">${esc(s.address)}</small>` : ''}</li>`).join('');
   const look = (p.look_for || []).map(l => `<li>${esc(l)}</li>`).join('');
@@ -304,10 +305,19 @@ async function loadPlan() {
 function openPicker() {
   const groups = {};
   S.ref.walks.forEach(w => (groups[w.market] = groups[w.market] || []).push(w));
-  $('#pickList').innerHTML = Object.entries(groups).map(([m, ws]) => `<div class="eyebrow" style="margin-top:12px">${esc(m)}</div>` + ws.map(w =>
+  const fwHtml = (S.fw && S.fw.walks || []).length ? `<div class="eyebrow" style="margin-top:4px">Count walks (objectives)</div>` + S.fw.walks.map(w =>
+    `<div class="item" data-fwalk="${esc(w.walk_id)}"><span class="txt"><b>${esc(w.title)}</b><div><small>${esc(fwSpec(w).timing || '')}</small></div><div class="small muted">${esc(w.question)}</div></span></div>`).join('') : '';
+  $('#pickList').innerHTML = fwHtml + Object.entries(groups).map(([m, ws]) => `<div class="eyebrow" style="margin-top:12px">${esc(m)}</div>` + ws.map(w =>
     `<div class="item" data-walk="${esc(w.walk)}"><span class="txt"><b>${esc(w.walk)}. ${esc(w.name)}</b><div><small>${esc(w.length_mi)} mi · ~${esc(w.est_minutes)} min · ${esc(w.mode)}</small></div><div class="small muted">${esc(w.question)}</div></span></div>`).join('')).join('')
     + `<div class="item" data-walk=""><span class="txt"><b>No set walk today</b><div><small>Just exploring. Captures still log where you are.</small></div></span></div>`;
   $$('#pickList .item').forEach(el => el.onclick = async () => {
+    if (el.dataset.fwalk) {
+      const fw = fwWalk(el.dataset.fwalk);
+      S.plan = { walk: fw.walk_id, field: true, title: fw.title, question: fw.question, written_by: 'you' };
+      ls.set('plan:' + today(), JSON.stringify(S.plan)); renderPlan(); closeSheets();
+      api('savePlan', { date: today(), title: S.plan.title, plan: S.plan, written_by: 'app' }).catch(() => { });
+      return;
+    }
     const w = el.dataset.walk ? walkById(el.dataset.walk) : null;
     S.plan = w ? { walk: w.walk, title: w.name, question: w.question, written_by: 'you' } : { title: 'Exploring', written_by: 'you' };
     ls.set('plan:' + today(), JSON.stringify(S.plan)); renderPlan(); closeSheets();
@@ -670,8 +680,113 @@ async function testPush() {
   b.disabled = false;
 }
 
+
+// ---------------- walk objectives: counts on named block stretches ----------------
+S.fw = null; S.tally = {}; let fwTimer = null;
+const fwWalk = (id) => S.fw && id ? (S.fw.walks || []).find(w => w.walk_id === id) : null;
+const fwSpec = (w) => { try { return JSON.parse(w.spec_json || '{}'); } catch (e) { return {}; } };
+const fwSeg = (id) => (S.fw.segments || []).find(s => s.segment_id === id) || { segment_id: id, name: id };
+const fwInds = (obj) => (S.fw.indicators || []).filter(i => i.objective_id === obj).sort((a, b) => Number(a.sort) - Number(b.sort));
+const fwLast = (seg, ind) => (S.fw.last || []).find(l => l.segment_id === seg && l.indicator_id === ind);
+const draftKey = (seg) => 'tally:' + today() + ':' + seg;
+function fwDraft(seg) { if (!S.tally[seg]) { try { S.tally[seg] = JSON.parse(ls.get(draftKey(seg)) || '{}'); } catch (e) { S.tally[seg] = {}; } } return S.tally[seg]; }
+function fwSaveDraft(seg) { ls.set(draftKey(seg), JSON.stringify(S.tally[seg] || {})); }
+async function loadFieldWalks() {
+  const c = await idb.get('kv', 'fw').catch(() => null); if (c && !S.fw) S.fw = c;
+  try { const r = await api('getFieldWalks', {}); S.fw = { walks: r.walks || [], segments: r.segments || [], indicators: r.indicators || [], last: r.last || [] }; await idb.put('kv', S.fw, 'fw').catch(() => { }); }
+  catch (e) { /* offline: keep cached */ }
+  if (S.plan && (S.plan.field || fwWalk(S.plan.walk))) renderPlan();
+}
+function renderFieldPlan(p) {
+  const box = $('#planBox'); const w = fwWalk(p.walk);
+  if (!w) { box.innerHTML = `<div class="plan"><h3>${esc(p.title || 'Count walk')}</h3><p class="muted small">Loading the walk's objectives…</p></div>`; return; }
+  const spec = fwSpec(w); const segs = spec.segments || [];
+  let cur = ls.get('fwseg:' + today() + ':' + w.walk_id) || (segs[0] && segs[0].id);
+  if (!segs.find(s => s.id === cur) && segs[0]) cur = segs[0].id;
+  const done = (id) => ls.get('fwdone:' + today() + ':' + id);
+  const sp = segs.find(s => s.id === cur) || {}; const seg = fwSeg(cur);
+  const base = seg.baseline_storefronts ? `City survey ${esc(seg.baseline_year)}: ${esc(seg.baseline_storefronts)} storefronts, ${Math.round(100 * Number(seg.baseline_vacant) / Number(seg.baseline_storefronts))}% vacant${seg.pcpc_name ? ' (' + esc(seg.pcpc_name) + ' corridor)' : ''}` : (seg.note ? esc(seg.note) : '');
+  const lastSF = fwLast(cur, 'B1.storefronts'), lastV = fwLast(cur, 'B1.vacant');
+  const lastLine = lastSF ? `Last count ${esc(lastSF.local_date)}: ${esc(lastSF.value)} storefronts${lastV ? ', ' + esc(lastV.value) + ' vacant' : ''}` : '';
+  const d = fwDraft(cur);
+  const row = (i) => {
+    const v = d[i.indicator_id]; const id = esc(i.indicator_id);
+    let ctl = '';
+    if (i.unit === 'count') ctl = `<div class="ctr"><button data-dec="${id}" aria-label="minus">−</button><b>${v ?? 0}</b><button data-inc="${id}" aria-label="plus">+</button></div>`;
+    else if (i.unit === 'per3min') ctl = `<div class="ctr"><button class="tmr" data-timer="${id}" data-s="${esc(i.timer_s || 180)}">${fwTimer && fwTimer.ind === i.indicator_id ? fmtT(fwTimer.left) : 'Start 3:00'}</button><button data-dec="${id}">−</button><b>${v ?? 0}</b><button data-inc="${id}" class="big">+</button></div>`;
+    else if (i.unit === 'yn') ctl = `<div class="seg2"><button data-yn="${id}" data-v="1" class="${v === 1 ? 'on' : ''}">Yes</button><button data-yn="${id}" data-v="0" class="${v === 0 ? 'on' : ''}">No</button></div>`;
+    else if (i.unit === 'scale5') ctl = `<div class="seg5">${[1, 2, 3, 4, 5].map(n => `<button data-sc="${id}" data-v="${n}" class="${v === n ? 'on' : ''}">${n}</button>`).join('')}</div>`;
+    else ctl = `<input class="usd" type="number" inputmode="decimal" step="0.01" data-num="${id}" value="${v ?? ''}" placeholder="$">`;
+    return `<div class="ind${v != null ? ' set' : ''}"><div class="il">${esc(i.label)}${i.protocol ? `<small>${esc(i.protocol)}</small>` : ''}</div>${ctl}</div>`;
+  };
+  const objs = (sp.objectives || []).map(o => {
+    const inds = fwInds(o); if (!inds.length) return '';
+    const q = inds[0].owner_question;
+    return `<div class="obj"><div class="oh"><span class="tag">${esc(o)}</span> ${esc(inds[0].objective_label)}</div>${q ? `<p class="oq">Ask: “${esc(q)}”</p>` : ''}${inds.map(row).join('')}</div>`;
+  }).join('');
+  const stores = (sp.stores || []).length ? `<div class="small muted" style="margin:6px 0 2px">Stores to check: ${sp.stores.map(esc).join(' · ')}</div>` : '';
+  box.innerHTML = `<div class="plan fwplan">
+    <h3>${esc(w.title)}</h3>
+    <p class="q">${esc(w.question)}</p>
+    <div class="meta"><span class="pill">${esc({ wd_lunch: 'Weekday lunch', wd_pm: 'Weekday afternoon', sat_am: 'Saturday morning' }[w.obs_window] || w.obs_window || '')}</span>${spec.timing ? `<span class="pill">${esc(spec.timing)}</span>` : ''}</div>
+    <div class="eyebrow" style="margin-top:12px">Stretch</div>
+    <div class="chips fwsegs">${segs.map(s => `<button data-seg="${esc(s.id)}" class="${s.id === cur ? 'on' : ''}">${done(s.id) ? '✓ ' : ''}${esc(fwSeg(s.id).name.split(' (')[0])}</button>`).join('')}</div>
+    <div class="seghead"><b>${esc(seg.name)}</b>${seg.count_point ? `<div class="small">Count point: ${esc(seg.count_point)}</div>` : ''}${base ? `<div class="small muted">${base}</div>` : ''}${lastLine ? `<div class="small muted">${lastLine}</div>` : ''}</div>
+    ${stores}${objs}
+    <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap"><button class="btn primary" id="fwSave">Save this stretch</button><button class="btn ghost" id="fwClear">Clear</button><button class="btn ghost" id="fwPick">Change walk</button></div>
+    <p class="msg" id="fwMsg"></p>
+  </div>`;
+  const rer = () => renderFieldPlan(p);
+  const setV = (ind, v) => { d[ind] = v; fwSaveDraft(cur); rer(); };
+  $$('.fwsegs button').forEach(b => b.onclick = () => { ls.set('fwseg:' + today() + ':' + w.walk_id, b.dataset.seg); rer(); });
+  $$('[data-inc]').forEach(b => b.onclick = () => setV(b.dataset.inc, (d[b.dataset.inc] || 0) + 1));
+  $$('[data-dec]').forEach(b => b.onclick = () => setV(b.dataset.dec, Math.max(0, (d[b.dataset.dec] || 0) - 1)));
+  $$('[data-yn]').forEach(b => b.onclick = () => setV(b.dataset.yn, d[b.dataset.yn] === Number(b.dataset.v) ? null : Number(b.dataset.v)));
+  $$('[data-sc]').forEach(b => b.onclick = () => setV(b.dataset.sc, d[b.dataset.sc] === Number(b.dataset.v) ? null : Number(b.dataset.v)));
+  $$('[data-num]').forEach(i => i.onchange = () => { d[i.dataset.num] = i.value === '' ? null : Number(i.value); fwSaveDraft(cur); });
+  $$('[data-timer]').forEach(b => b.onclick = () => {
+    if (fwTimer) { clearInterval(fwTimer.h); fwTimer = null; rer(); return; }
+    fwTimer = { ind: b.dataset.timer, left: Number(b.dataset.s) || 180 };
+    fwTimer.h = setInterval(() => { fwTimer.left--; const el = document.querySelector(`[data-timer="${CSS.escape(fwTimer.ind)}"]`); if (el) el.textContent = fmtT(fwTimer.left);
+      if (fwTimer.left <= 0) { clearInterval(fwTimer.h); fwTimer = null; try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch (e) { } toast('Time. Enter the count.'); rer(); } }, 1000);
+    rer();
+  });
+  $('#fwClear').onclick = () => { if (!confirmTap($('#fwClear'), 'Tap again to clear')) return; S.tally[cur] = {}; fwSaveDraft(cur); rer(); };
+  $('#fwPick').onclick = openPicker;
+  $('#fwSave').onclick = () => saveStretch(w, cur);
+}
+const fmtT = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+function confirmTap(btn, label) {
+  if (btn.dataset.armed) return true;
+  const orig = btn.textContent; btn.dataset.armed = '1'; btn.textContent = label;
+  setTimeout(() => { if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = orig; } }, 3000);
+  return false;
+}
+async function saveStretch(w, segId) {
+  const d = fwDraft(segId); const ids = Object.keys(d).filter(k => d[k] != null);
+  if (!ids.length) { $('#fwMsg').textContent = 'Nothing counted yet on this stretch.'; return; }
+  const seg = fwSeg(segId); const where = S.where; const ts = new Date().toISOString(); const ua = navigator.userAgent;
+  const den = d['B1.storefronts'] != null ? d['B1.storefronts'] : null;
+  for (const ind of ids) {
+    const meta = (S.fw.indicators || []).find(i => i.indicator_id === ind) || {};
+    const v = d[ind];
+    const shown = meta.unit === 'yn' ? (v ? 'yes' : 'no') : meta.unit === 'usd' ? '$' + v : String(v);
+    await idb.put('outbox', {
+      id: crypto.randomUUID(), ts, local_date: today(), kind: 'tally', walk: w.walk_id, market: where ? where.market : null, mode: 'walk',
+      lat: S.pos ? +S.pos.lat.toFixed(6) : null, lon: S.pos ? +S.pos.lon.toFixed(6) : null, accuracy_m: S.pos ? Math.round(S.pos.acc) : null,
+      area_name: where ? where.area : seg.name, tract_geoid: where && where.lens ? where.lens.geoid : null, corridor_code: where && where.cor ? where.cor.code : null, zone: where && where.terr ? where.terr.zone : null,
+      business_ref: null, business_name: null, text: `${seg.name.split(' (')[0]} · ${meta.label || ind}: ${shown}`, saw: [], role: null, handed: [], followup: 'none', contact: null,
+      objective_id: ind.split('.')[0], indicator_id: ind, value: v, unit: meta.unit || null, denominator: den, segment_id: segId, obs_window: w.obs_window || null,
+      device: /iPad/.test(ua) ? 'iPad' : /iPhone/.test(ua) ? 'iPhone' : /Mac/.test(ua) ? 'Mac' : 'other'
+    });
+  }
+  ls.set('fwdone:' + today() + ':' + segId, '1'); S.tally[segId] = {}; fwSaveDraft(segId);
+  toast(`Saved ${ids.length} counts for ${seg.name.split(' (')[0]}`);
+  await refreshOutbox(); syncSoon(300); renderPlan();
+}
+
 // ---------------- log, follow-ups, edit ----------------
-const KIND = { note: 'Note', photo: 'Photo', voice: 'Voice', talk: 'Talked', dropoff: 'Dropped', endday: 'Day wrap', inbound: 'Inbound lead' };
+const KIND = { note: 'Note', photo: 'Photo', voice: 'Voice', talk: 'Talked', dropoff: 'Dropped', endday: 'Day wrap', inbound: 'Inbound lead', tally: 'Count' };
 function capCard(c, pending) {
   const t = new Date(c.ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: TZ });
   const extra = [c.role, (c.saw || []).join(', '), (c.handed || []).length ? 'Handed: ' + c.handed.join(', ') : '', c.followup && c.followup !== 'none' ? 'Follow up: ' + c.followup : ''].filter(Boolean).join(' · ');
@@ -1014,7 +1129,7 @@ async function start(index) {
   await refreshOutbox();
   renderCarry();
   const cc = await idb.get('kv', 'cmd').catch(() => null); if (cc) { S.cmd = cc; S.cmd.stale = true; renderWaiting(); renderCal(); }
-  startGps(); loadPlan(); checkBackend(); loadCaptures(); loadCommand(); syncSoon(1500);
+  startGps(); loadPlan(); checkBackend(); loadCaptures(); loadCommand(); loadFieldWalks(); syncSoon(1500);
   const v = ls.get('view'); switchView(v && v !== 'more' ? v : 'today');
 }
 

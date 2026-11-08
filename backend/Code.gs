@@ -59,6 +59,7 @@ const ACTIONS = {
   savePushSub: (d) => savePushSub_(d),
   removePushSub: (d) => removePushSub_(d),
   testPush: () => push_('Field Guide test', 'Buzz works on this device. Real buzzes only come weekdays 10–6.', { force: true, tag: 'test' }),
+  getFieldWalks: () => getFieldWalks_(),
   pushStatus: () => ({ configured: !!P.getProperty('PUSH_URL'), devices: subs_().map(s => s.device) }),
 };
 
@@ -148,12 +149,14 @@ function saveCapture_(c) {
     mediaId = file.getId(); mediaUrl = file.getUrl();
   }
   const S = 'STRING', F = 'FLOAT64';
-  bq_('INSERT INTO ' + T('field_captures') + ' (id, ts, local_date, kind, walk, market, mode, lat, lon, accuracy_m, area_name, tract_geoid, corridor_code, zone, business_ref, business_name, text, saw, role, handed, followup, followup_done, contact, media_type, media_drive_id, media_url, device, received_ts, source) VALUES ' +
-    '(@id, TIMESTAMP(@ts), DATE(@ld), @kind, @walk, @market, @mode, @lat, @lon, @acc, @area, @tract, @cor, @zone, @bref, @bname, @text, @saw, @role, @handed, @fu, FALSE, @contact, @mt, @mid, @murl, @dev, CURRENT_TIMESTAMP(), "guide")',
+  bq_('INSERT INTO ' + T('field_captures') + ' (id, ts, local_date, kind, walk, market, mode, lat, lon, accuracy_m, area_name, tract_geoid, corridor_code, zone, business_ref, business_name, text, saw, role, handed, followup, followup_done, contact, media_type, media_drive_id, media_url, device, received_ts, source, objective_id, indicator_id, value, unit, denominator, segment_id, obs_window) VALUES ' +
+    '(@id, TIMESTAMP(@ts), DATE(@ld), @kind, @walk, @market, @mode, @lat, @lon, @acc, @area, @tract, @cor, @zone, @bref, @bname, @text, @saw, @role, @handed, @fu, FALSE, @contact, @mt, @mid, @murl, @dev, CURRENT_TIMESTAMP(), "guide", @obj, @ind, @val, @unit, @den, @seg, @win)',
     [p_('id', S, c.id), p_('ts', S, c.ts), p_('ld', S, c.local_date), p_('kind', S, c.kind), p_('walk', S, c.walk), p_('market', S, c.market), p_('mode', S, c.mode),
      p_('lat', F, c.lat), p_('lon', F, c.lon), p_('acc', F, c.accuracy_m), p_('area', S, c.area_name), p_('tract', S, c.tract_geoid), p_('cor', S, c.corridor_code), p_('zone', S, c.zone),
      p_('bref', S, c.business_ref), p_('bname', S, c.business_name), p_('text', S, c.text), p_('saw', S, c.saw || []), p_('role', S, c.role), p_('handed', S, c.handed || []),
-     p_('fu', S, c.followup || 'none'), p_('contact', S, c.contact), p_('mt', S, c.media_type), p_('mid', S, mediaId), p_('murl', S, mediaUrl), p_('dev', S, c.device)]);
+     p_('fu', S, c.followup || 'none'), p_('contact', S, c.contact), p_('mt', S, c.media_type), p_('mid', S, mediaId), p_('murl', S, mediaUrl), p_('dev', S, c.device),
+     p_('obj', S, c.objective_id || null), p_('ind', S, c.indicator_id || null), p_('val', F, c.value == null ? null : c.value), p_('unit', S, c.unit || null),
+     p_('den', 'INT64', c.denominator == null ? null : c.denominator), p_('seg', S, c.segment_id || null), p_('win', S, c.obs_window || null)]);
   mirror_(c, mediaUrl);
   return { id: c.id, media_url: mediaUrl };
 }
@@ -467,6 +470,18 @@ function installPushTriggers() {
   ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'callReminders').forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('callReminders').timeBased().everyMinutes(5).create();
   return 'callReminders every 5 min';
+}
+
+// ---------- walk objectives (counts on named block stretches) ----------
+// Library, segments and walks live in BigQuery (dim_field_objectives, dim_field_segments, dim_field_walks); the app caches them for offline.
+function getFieldWalks_() {
+  const walks = bq_('SELECT walk_id, title, zip5, obs_window, question, spec_json FROM ' + T('dim_field_walks') + ' WHERE active ORDER BY walk_id', []);
+  const segs = bq_('SELECT segment_id, name, zip5, pcpc_name, count_point, baseline_storefronts, baseline_vacant, baseline_year, sentinel, note FROM ' + T('dim_field_segments'), []);
+  const inds = bq_('SELECT objective_id, objective_label, lens, indicator_id, label, unit, timer_s, sort, protocol, owner_question FROM ' + T('dim_field_objectives') + ' ORDER BY objective_id, sort', []);
+  // last saved values per segment (so a recount shows the previous count)
+  const last = bq_('SELECT segment_id, indicator_id, value, CAST(local_date AS STRING) local_date, obs_window FROM ' + T('field_captures') +
+    ' WHERE kind = "tally" AND segment_id IS NOT NULL QUALIFY ROW_NUMBER() OVER (PARTITION BY segment_id, indicator_id ORDER BY ts DESC) = 1', []);
+  return { walks: walks, segments: segs, indicators: inds, last: last };
 }
 
 // ---------- command center: Waiting on you ----------

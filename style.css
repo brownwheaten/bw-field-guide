@@ -174,3 +174,25 @@ audio{width:100%;margin-top:8px}
 .cal .mk{font-size:.7rem;font-weight:700;color:var(--sienna);text-transform:uppercase;letter-spacing:.08em}
 .pulse{margin:-4px 2px 0;font-size:.85rem;color:var(--muted)}
 .btn.armed{background:var(--pin);color:#fff;border-color:var(--pin)}
+
+/* walk objectives */
+.fwplan .seghead{margin:10px 0 4px;padding:8px 10px;background:var(--bg);border-radius:8px;border:1px solid var(--line)}
+.fwplan .obj{margin-top:12px;border-top:1px solid var(--line);padding-top:8px}
+.fwplan .oh{font-weight:700;color:var(--ink)}
+.fwplan .tag{font-size:.7rem;font-weight:700;letter-spacing:.06em;background:var(--ink);color:var(--onInk);padding:2px 7px;border-radius:999px}
+.fwplan .oq{font-size:.85rem;font-style:italic;color:var(--muted);margin:4px 0 2px}
+.fwplan .ind{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px dashed var(--line)}
+.fwplan .ind:last-child{border-bottom:0}
+.fwplan .ind.set .il{color:var(--ink)}
+.fwplan .il{font-size:.92rem;flex:1;min-width:0}
+.fwplan .il small{display:block;font-size:.72rem;color:var(--muted);margin-top:2px}
+.fwplan .ctr{display:flex;align-items:center;gap:6px}
+.fwplan .ctr button{min-width:44px;min-height:44px;border-radius:10px;border:1px solid var(--line);background:var(--chip);font-size:1.3rem;color:var(--ink)}
+.fwplan .ctr button.big{min-width:64px;background:var(--ink);color:var(--onInk);border-color:var(--ink)}
+.fwplan .ctr button.tmr{min-width:84px;font-size:.85rem;font-variant-numeric:tabular-nums}
+.fwplan .ctr b{min-width:30px;text-align:center;font-size:1.15rem;font-variant-numeric:tabular-nums}
+.fwplan .seg2,.fwplan .seg5{display:flex;gap:4px}
+.fwplan .seg2 button,.fwplan .seg5 button{min-height:44px;min-width:44px;padding:0 10px;border-radius:10px;border:1px solid var(--line);background:var(--chip);color:var(--ink)}
+.fwplan .seg2 button.on,.fwplan .seg5 button.on{background:var(--ink);color:var(--onInk);border-color:var(--ink)}
+.fwplan .usd{width:90px;min-height:44px}
+.fwplan{padding-bottom:76px}
