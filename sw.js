@@ -1,6 +1,6 @@
 // B+W Field Guide service worker: app shell offline, area tiles and map tiles cached as you go, backend always live.
-const V = 'bwfg-v1.3.0';
-const SHELL = ['./', 'index.html', 'style.css?v=3', 'app.js?v=7', 'data.enc', 'manifest.webmanifest', 'icon-192.png', 'icon-180.png', 'card-qr.png',
+const V = 'bwfg-v1.4.0';
+const SHELL = ['./', 'index.html', 'style.css?v=5', 'app.js?v=9', 'data.enc', 'manifest.webmanifest', 'icon-192.png', 'icon-180.png', 'card-qr.png',
   'vendor/leaflet.css', 'vendor/leaflet.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => ![V, 'tiles', 'areas'].includes(k)).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
@@ -22,4 +22,20 @@ self.addEventListener('fetch', e => {
     return;
   }
   e.respondWith(caches.match(e.request).then(hit => hit || fetch(e.request).then(r => put(V, e.request, r))));
+});
+
+// Buzz: show every push (iOS revokes permission for pushes that show nothing), badge the icon, tap opens Today.
+self.addEventListener('push', e => {
+  let d = {}; try { d = e.data ? e.data.json() : {}; } catch (err) { d = { title: 'Field Guide', body: e.data && e.data.text() }; }
+  e.waitUntil(Promise.all([
+    self.registration.showNotification(d.title || 'Field Guide', { body: d.body || '', tag: d.tag || 'lead', icon: 'icon-192.png', badge: 'icon-192.png', data: { url: d.url || './' } }),
+    (self.navigator && self.navigator.setAppBadge && d.badge) ? self.navigator.setAppBadge(d.badge).catch(() => { }) : Promise.resolve()
+  ]));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+    const c = cs.find(x => 'focus' in x); if (c) { c.postMessage({ goto: 'today' }); return c.focus(); }
+    return self.clients.openWindow('./');
+  }));
 });

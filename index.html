@@ -14,7 +14,7 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="stylesheet" href="vendor/leaflet.css">
-<link rel="stylesheet" href="style.css?v=4">
+<link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
 
@@ -136,6 +136,12 @@
         <label for="scriptUrl" class="lbl">Backend URL</label>
         <input id="scriptUrl" type="url" placeholder="https://script.google.com/macros/s/…/exec">
         <button id="saveUrl" class="btn">Save</button>
+      </div>
+      <div class="card">
+        <div class="eyebrow">Buzz on this device</div>
+        <p id="pushInfo" class="muted small">Leads from real prospects and a reminder 15 minutes before calls. Weekdays 10–6 only.</p>
+        <button id="pushOn" class="btn">Turn on buzz</button>
+        <button id="pushTest" class="btn ghost" hidden>Send a test buzz</button>
       </div>
       <div class="card">
         <div class="eyebrow">This device</div>
@@ -274,6 +280,6 @@
 <div id="toast" class="toast" role="status" hidden></div>
 
 <script src="vendor/leaflet.js"></script>
-<script src="app.js?v=8"></script>
+<script src="app.js?v=9"></script>
 </body>
 </html>

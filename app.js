@@ -4,7 +4,7 @@
    Storefronts come from the backend in 0.02° tiles (OSM via BigQuery) and are cached on the device.
    Captures and plans live in BigQuery via the Apps Script backend; captures wait in IndexedDB until sent. */
 'use strict';
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const TZ = 'America/New_York';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -621,6 +621,55 @@ async function loadCommand() {
   renderWaiting(); renderCal();
 }
 
+
+// ---------------- buzz: web push ----------------
+const VAPID_PUBLIC = 'BHG2ChcU_BiDx5wDQRXZWP1Lz89t5njTvsiqcCNBB3K1FyUeWiB4antlk8yxwpz5K9VUjwoiGgQVq3YKdeNPg5w';
+const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const deviceName = () => /iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ? 'iPad' : /iPhone/.test(navigator.userAgent) ? 'iPhone' : /Mac/.test(navigator.platform) ? 'Mac' : 'Computer';
+function b64uToBytes(s) { const p = '='.repeat((4 - s.length % 4) % 4); const b = atob((s + p).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(b, c => c.charCodeAt(0)); }
+async function renderPush() {
+  const info = $('#pushInfo'), on = $('#pushOn'), test = $('#pushTest');
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    info.textContent = /iPhone|iPad/.test(navigator.userAgent) && !isStandalone()
+      ? 'Open the Field Guide from its home-screen icon (not Safari) to turn on buzz.'
+      : 'This browser can\'t receive buzzes.';
+    on.hidden = true; test.hidden = true; return;
+  }
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  if (sub && Notification.permission === 'granted') {
+    info.textContent = 'Buzz is on for this ' + deviceName() + '. Leads from real prospects and 15 minutes before calls, weekdays 10–6.';
+    on.textContent = 'Turn off buzz'; on.dataset.state = 'on'; test.hidden = false;
+  } else if (Notification.permission === 'denied') {
+    info.textContent = 'Notifications are blocked for the Field Guide. Turn them on in Settings → Notifications → Field Guide, then come back.';
+    on.hidden = true; test.hidden = true;
+  } else { on.textContent = 'Turn on buzz'; on.dataset.state = 'off'; on.hidden = false; test.hidden = true; }
+}
+async function togglePush() {
+  const on = $('#pushOn'); on.disabled = true;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    if (on.dataset.state === 'on') {
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) { await api('removePushSub', { endpoint: sub.endpoint }).catch(() => { }); await sub.unsubscribe(); }
+      toast('Buzz off on this device');
+    } else {
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') { toast('Notifications not allowed'); return; }
+      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(VAPID_PUBLIC) });
+      await api('savePushSub', { sub: sub.toJSON(), device: deviceName() });
+      toast('Buzz on. Try a test.');
+    }
+  } catch (e) { toast('Couldn\'t change buzz: ' + e.message); }
+  finally { on.disabled = false; renderPush(); }
+}
+async function testPush() {
+  const b = $('#pushTest'); b.disabled = true;
+  try { const r = await api('testPush', {}); toast(r.sent ? 'Test sent. It should buzz in a few seconds.' : 'Not sent: ' + (r.reason || (r.errors || []).join(', ') || 'unknown')); }
+  catch (e) { toast('Test failed: ' + e.message); }
+  b.disabled = false;
+}
+
 // ---------------- log, follow-ups, edit ----------------
 const KIND = { note: 'Note', photo: 'Photo', voice: 'Voice', talk: 'Talked', dropoff: 'Dropped', endday: 'Day wrap', inbound: 'Inbound lead' };
 function capCard(c, pending) {
@@ -896,7 +945,7 @@ function switchView(v) {
   if (v === 'map') setTimeout(initMap, 30);
   if (v === 'fu' || v === 'log') loadCaptures();
   if (v === 'today') loadCommand();
-  if (v === 'more') renderSyncChip();
+  if (v === 'more') { renderSyncChip(); renderPush().catch(() => { }); }
   ls.set('view', v);
 }
 function closeSheets() { $$('.sheet').forEach(s => s.hidden = true); }
@@ -946,6 +995,8 @@ function bindUI() {
   $('#lockNow').onclick = async () => { ls.del('t'); await idb.del('kv', 'k'); location.reload(); };
   $('#endDayBtn').onclick = endDay;
   $('#waitList').addEventListener('click', onWaitClick);
+  $('#pushOn').onclick = togglePush;
+  $('#pushTest').onclick = testPush;
   window.addEventListener('online', () => { S.online = true; renderSyncChip(); syncSoon(500); });
   window.addEventListener('offline', () => { S.online = false; renderSyncChip(); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { syncSoon(800); loadPlan(); loadCommand(); } });
@@ -969,7 +1020,10 @@ async function start(index) {
 
 async function boot() {
   try { S.cfg = JSON.parse(ls.get('cfg') || '{}'); } catch (e) { S.cfg = {}; }
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => { });
+    navigator.serviceWorker.addEventListener('message', e => { if (e.data && e.data.goto && S.ref) { switchView(e.data.goto); loadCommand(); } });
+  }
   const raw = await idb.get('kv', 'k').catch(() => null);
   S.token = ls.get('t');
   if (raw && S.token) {

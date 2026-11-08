@@ -11,7 +11,7 @@
  *   HUBSPOT_TOKEN   optional  HubSpot private app token, for "Add to HubSpot"
  *   SHEET_ID        optional  B+W Field Notes (responses) sheet; captures are mirrored to a "Guide captures" tab
  *   BOOKING_URL     optional  private appointment-schedule link, used only by "Send booking link" (never put it in the repo)
- *   PUSH_URL        optional  phase 2: push helper endpoint; PUSH_SECRET its shared secret
+ *   PUSH_URL        optional  push helper (Cloud Run) URL; PUSH_SECRET its shared secret; PUSH_SUBS is written by the app
  */
 
 const P = PropertiesService.getScriptProperties();
@@ -56,6 +56,10 @@ const ACTIONS = {
   getPulse: () => getPulse_(),
   sendBookingLink: (d) => sendBookingLink_(d),
   bookingText: (d) => ({ text: bookingText_(d.first) }),
+  savePushSub: (d) => savePushSub_(d),
+  removePushSub: (d) => removePushSub_(d),
+  testPush: () => push_('Field Guide test', 'Buzz works on this device. Real buzzes only come weekdays 10–6.', { force: true, tag: 'test' }),
+  pushStatus: () => ({ configured: !!P.getProperty('PUSH_URL'), devices: subs_().map(s => s.device) }),
 };
 
 // ---------- helpers ----------
@@ -403,24 +407,66 @@ function installInboundTrigger() {
   return pullInbound();
 }
 
-// ---------- buzz (phase 2 hook) ----------
-// Quiet hours live here: weekdays 10:00–18:00 ET only; anything outside is dropped (it still sits in the list).
-// Sends only if PUSH_URL (+ PUSH_SECRET) is set; until then this is a no-op.
+// ---------- buzz (push notifications) ----------
+// Apps Script decides what buzzes and when; the push helper (Cloud Run, PUSH_URL + PUSH_SECRET) only signs and sends.
+// Quiet hours: weekdays 10:00–18:00 ET only. Outside them a buzz is dropped, not delayed (the item still sits in the list).
+// Device subscriptions live in Script Property PUSH_SUBS (JSON array, one per iPhone/iPad/computer).
 function inWorkHours_(d) {
   const dow = Number(Utilities.formatDate(d || new Date(), 'America/New_York', 'u')); // 1=Mon … 7=Sun
   const h = Number(Utilities.formatDate(d || new Date(), 'America/New_York', 'H'));
   return dow <= 5 && h >= 10 && h < 18;
 }
+function subs_() { try { return JSON.parse(P.getProperty('PUSH_SUBS') || '[]'); } catch (e) { return []; } }
+function savePushSub_(d) {
+  const s = d.sub; if (!s || !s.endpoint || !s.keys) throw new Error('bad subscription');
+  const list = subs_().filter(x => x.endpoint !== s.endpoint && x.device !== d.device);
+  list.push({ endpoint: s.endpoint, keys: s.keys, device: String(d.device || 'device').slice(0, 40), added: new Date().toISOString() });
+  P.setProperty('PUSH_SUBS', JSON.stringify(list.slice(-6)));
+  return { devices: list.length };
+}
+function removePushSub_(d) {
+  const list = subs_().filter(x => x.endpoint !== d.endpoint);
+  P.setProperty('PUSH_SUBS', JSON.stringify(list));
+  return { devices: list.length };
+}
+function push_(title, body, opts) {
+  opts = opts || {};
+  const url = P.getProperty('PUSH_URL'), subs = subs_();
+  if (!url || !subs.length) return { sent: 0, reason: !url ? 'PUSH_URL not set' : 'no devices' };
+  if (!opts.force && !inWorkHours_()) return { sent: 0, reason: 'quiet hours' };
+  const r = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+    headers: { 'X-Push-Secret': P.getProperty('PUSH_SECRET') || '' },
+    payload: JSON.stringify({ subs: subs.map(s => ({ endpoint: s.endpoint, keys: s.keys })), title: title, body: body, url: './', tag: opts.tag || 'lead', badge: opts.badge || 0 }) });
+  let j = {}; try { j = JSON.parse(r.getContentText()); } catch (e) { }
+  if (j.gone && j.gone.length) P.setProperty('PUSH_SUBS', JSON.stringify(subs.filter(s => j.gone.indexOf(s.endpoint) < 0)));
+  return { code: r.getResponseCode(), sent: j.sent || 0, errors: j.errors || [] };
+}
 function notifyLeads_(items) {
   const buzz = items.filter(i => !i.vendor && i.mode !== 'Missed call');
-  if (!buzz.length || !inWorkHours_()) return;
-  const url = P.getProperty('PUSH_URL'); if (!url) return;
-  const title = buzz.length > 1 ? buzz.length + ' new leads' : ({ Call: 'Voicemail', Text: 'Text', 'Website form': 'Website form', 'Website chat': 'Website chat', 'Letter reply': 'Reply to your letter' }[buzz[0].mode] || 'New lead');
+  if (!buzz.length) return;
+  const title = buzz.length > 1 ? buzz.length + ' new leads' : ({ Call: 'Voicemail', Text: 'Text to the business line', 'Website form': 'Website form', 'Website chat': 'Website chat', 'Letter reply': 'Reply to your letter' }[buzz[0].mode] || 'New lead');
   const body = buzz.map(i => i.org || i.subj).filter(Boolean).join(' · ').slice(0, 140) || 'Open the Field Guide';
-  try {
-    UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
-      headers: { 'X-Push-Secret': P.getProperty('PUSH_SECRET') || '' }, payload: JSON.stringify({ title: title, body: body, url: './#today' }) });
-  } catch (e) { console.warn('push failed', e); }
+  try { push_(title, body, { tag: 'lead' }); } catch (e) { console.warn('push failed', e); }
+}
+// Every 5 minutes: buzz once for each calendar event starting 10–20 minutes from now (primary calendar, not all-day).
+function callReminders() {
+  if (!inWorkHours_()) return;
+  const now = new Date(), cache = CacheService.getScriptCache();
+  CalendarApp.getDefaultCalendar().getEvents(new Date(now.getTime() + 10 * 60000), new Date(now.getTime() + 20 * 60000)).forEach(ev => {
+    if (ev.isAllDayEvent() || ev.getStartTime() < new Date(now.getTime() + 10 * 60000)) return;
+    if (ev.getMyStatus && ev.getMyStatus() === CalendarApp.GuestStatus.NO) return;
+    const key = 'rem_' + ev.getId().slice(0, 40) + '_' + ev.getStartTime().getTime();
+    if (cache.get(key)) return;
+    cache.put(key, '1', 21600);
+    const t = Utilities.formatDate(ev.getStartTime(), 'America/New_York', 'h:mm a');
+    push_('In 15 min: ' + ev.getTitle().slice(0, 60), t + (ev.getLocation() ? ' · ' + ev.getLocation().slice(0, 80) : ''), { tag: 'cal' });
+  });
+}
+// Run once from the editor after PUSH_URL / PUSH_SECRET are set.
+function installPushTriggers() {
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'callReminders').forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('callReminders').timeBased().everyMinutes(5).create();
+  return 'callReminders every 5 min';
 }
 
 // ---------- command center: Waiting on you ----------
