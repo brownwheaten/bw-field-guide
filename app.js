@@ -4,7 +4,7 @@
    Storefronts come from the backend in 0.02° tiles (OSM via BigQuery) and are cached on the device.
    Captures and plans live in BigQuery via the Apps Script backend; captures wait in IndexedDB until sent. */
 'use strict';
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.3.0';
 const TZ = 'America/New_York';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -484,6 +484,143 @@ async function loadCaptures() {
   renderLog(); renderFu(); drawCaps();
 }
 
+
+// ---------------- command center: waiting on you, today, pulse ----------------
+const PIN_MODES = ['Call', 'Text', 'Missed call'];
+const MODE_TAG = { Call: 'Voicemail', Text: 'Text', 'Missed call': 'Missed call', 'Website form': 'Website form', 'Website chat': 'Website chat', 'Letter reply': 'Reply to letter', Phone: 'Phone' };
+const VOICE_URL = 'https://voice.google.com/u/0/messages';
+S.cmd = null;
+const ago = (iso) => {
+  const m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (m < 60) return Math.max(m, 1) + ' min ago';
+  if (m < 60 * 24) return Math.round(m / 60) + ' h ago';
+  return Math.round(m / 1440) + ' d ago';
+};
+const emailIn = (s) => (String(s || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [''])[0];
+const phoneIn = (s) => (String(s || '').match(/\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}/) || [''])[0];
+function waitItems() {
+  if (!S.cmd || !S.cmd.waiting) return [];
+  const w = S.cmd.waiting, out = [];
+  (w.captures || []).forEach(c => {
+    const inbound = c.kind === 'inbound';
+    const body = String(c.text || '').split('\n\n').slice(1).join(' ').trim() || String(c.text || '');
+    out.push({
+      type: 'capture', id: c.id, ts: c.ts, mode: c.mode,
+      pin: inbound && PIN_MODES.includes(c.mode), vendor: c.role === 'vendor',
+      grp: !inbound ? 3 : (PIN_MODES.includes(c.mode) ? 0 : (c.role === 'vendor' ? 4 : 1)),
+      tag: inbound ? (MODE_TAG[c.mode] || 'Lead') : 'Field: ' + c.followup,
+      who: c.business_name || c.area_name || phoneIn(c.contact) || emailIn(c.contact) || (inbound ? 'Unknown caller' : ''),
+      snip: body.slice(0, 160), email: inbound && c.role !== 'vendor' ? (emailIn(c.contact) || (c.mode === 'Call' ? emailIn(c.text) : '')) : '', phone: phoneIn(c.contact) || phoneIn(c.text)
+    });
+  });
+  (w.pieces || []).forEach(p => out.push({
+    type: 'piece', id: p.row_id, ts: p.followup_due, grp: 2, due: true,
+    tag: (p.lane || 'Mail') + ' follow-up due' + (p.followup_due < today() ? ' (since ' + p.followup_due.slice(5) + ')' : ''),
+    who: p.org + (p.addressed_to && !/team/i.test(p.addressed_to) ? ' · ' + p.addressed_to : ''),
+    snip: [p.ref_code, p.recipient_email ? 'email: ' + p.recipient_email : '', String(p.notes || '').split('|').pop().trim()].filter(Boolean).join(' · ').slice(0, 160)
+  }));
+  out.sort((x, y) => x.grp - y.grp || (x.grp === 2 ? String(x.ts).localeCompare(String(y.ts)) : String(y.ts).localeCompare(String(x.ts))));
+  return out;
+}
+function renderWaiting() {
+  const items = waitItems(), el = $('#waitList');
+  const live = items.filter(i => !i.vendor);
+  const urgent = items.filter(i => i.pin || i.grp === 1).length;
+  try { if (navigator.setAppBadge) urgent ? navigator.setAppBadge(urgent) : navigator.clearAppBadge(); } catch (e) { }
+  $('#waitAsOf').textContent = S.cmd && S.cmd.at ? (S.cmd.stale ? 'as of ' : 'updated ') + new Date(S.cmd.at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: TZ }) : '';
+  if (!S.cmd) { el.innerHTML = '<p class="muted small">Connect to load what\'s waiting.</p>'; return; }
+  if (!items.length) { el.innerHTML = '<p class="muted">Nothing waiting. Go walk.</p>'; renderPulse(0); return; }
+  let lastGrp = -1;
+  el.innerHTML = items.map(i => {
+    const sep = (i.grp >= 2 && i.grp !== lastGrp) ? `<div class="wsep">${i.grp === 2 ? 'Follow-ups due' : i.grp === 3 ? 'From the field' : 'Probably vendors'}</div>` : '';
+    lastGrp = i.grp;
+    const key = i.type + ':' + i.id;
+    const acts = [];
+    if (i.type === 'capture' && i.email) acts.push(`<button class="btn" data-book="${esc(key)}">Send booking link</button>`);
+    if (i.type === 'capture' && !i.email && (i.mode === 'Text' || i.phone) && i.grp <= 1) acts.push(`<button class="btn" data-booktext="${esc(key)}">Copy link · open Voice</button>`);
+    acts.push(`<button class="btn ghost" data-handled="${esc(key)}">Handled</button>`);
+    return sep + `<div class="wi${i.pin ? ' pin' : ''}${i.vendor ? ' vendor' : ''}${i.due ? ' due' : ''}">
+      <div class="hd"><span class="tag">${esc(i.tag)}</span><span>${i.due ? '' : esc(ago(i.ts))}</span></div>
+      <div class="who">${esc(i.who)}</div>${i.snip ? `<div class="snip">${esc(i.snip)}</div>` : ''}
+      <div class="acts">${acts.join('')}</div></div>`;
+  }).join('');
+  renderPulse(live.length);
+}
+function findItem(key) { return waitItems().find(i => i.type + ':' + i.id === key); }
+function dropItem(it) {
+  const w = S.cmd.waiting;
+  if (it.type === 'piece') w.pieces = w.pieces.filter(p => p.row_id !== it.id);
+  else w.captures = w.captures.filter(c => c.id !== it.id);
+  idb.put('kv', S.cmd, 'cmd').catch(() => { });
+  renderWaiting();
+}
+let armedBtn = null, armedT = null;
+async function onWaitClick(e) {
+  const hb = e.target.closest('[data-handled]'), bb = e.target.closest('[data-book]'), tb = e.target.closest('[data-booktext]');
+  if (hb) {
+    const it = findItem(hb.dataset.handled); if (!it) return;
+    hb.disabled = true;
+    try { await api('markHandled', { type: it.type, id: it.id }); dropItem(it); toast('Handled'); }
+    catch (err) { hb.disabled = false; toast('Needs a connection.'); }
+  } else if (bb) {
+    const it = findItem(bb.dataset.book); if (!it) return;
+    if (armedBtn !== bb) { // two taps: the second tap is your OK to send
+      if (armedBtn) { armedBtn.classList.remove('armed'); armedBtn.textContent = 'Send booking link'; }
+      armedBtn = bb; bb.classList.add('armed'); bb.textContent = 'Tap again: send to ' + it.email;
+      clearTimeout(armedT); armedT = setTimeout(() => { bb.classList.remove('armed'); bb.textContent = 'Send booking link'; armedBtn = null; }, 6000);
+      return;
+    }
+    armedBtn = null; clearTimeout(armedT); bb.disabled = true; bb.textContent = 'Sending…';
+    try { await api('sendBookingLink', { type: it.type, id: it.id, to: it.email, first: '' }); dropItem(it); toast('Booking link sent to ' + it.email); }
+    catch (err) { bb.disabled = false; bb.classList.remove('armed'); bb.textContent = 'Send booking link'; toast('Not sent: ' + err.message); }
+  } else if (tb) {
+    tb.disabled = true;
+    try {
+      const r = await api('bookingText', {});
+      await navigator.clipboard.writeText(r.text);
+      toast('Copied. Paste it in Voice.');
+      window.open(VOICE_URL, '_blank');
+    } catch (err) { toast('Couldn\'t copy: ' + err.message); }
+    tb.disabled = false;
+  }
+}
+function renderCal() {
+  const el = $('#calList'), ev = (S.cmd && S.cmd.today && S.cmd.today.events) || null;
+  if (!ev) { el.innerHTML = '<p class="muted small">Calendar not connected yet.</p>'; return; }
+  const d = today();
+  const todays = ev.filter(e => new Date(e.start).toLocaleDateString('en-CA', { timeZone: TZ }) === d || e.all_day && e.start.slice(0, 10) === d);
+  const next = todays.length ? todays : ev.slice(0, 3);
+  if (!next.length) { el.innerHTML = '<p class="muted small">Nothing on the calendar.</p>'; return; }
+  el.innerHTML = (todays.length ? '' : '<p class="muted small">Nothing left today. Next:</p>') + next.map(e => {
+    const st = new Date(e.start), mins = (st - Date.now()) / 60000;
+    const t = e.all_day ? 'All day' : st.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: TZ });
+    const day = new Date(e.start).toLocaleDateString('en-CA', { timeZone: TZ }) === d ? '' : st.toLocaleDateString('en-US', { weekday: 'short', timeZone: TZ }) + ' ';
+    return `<div class="ev${mins > 0 && mins <= 30 ? ' soon' : ''}"><div class="t">${esc(day + t)}</div><div><div>${esc(e.title)}${e.booked ? ' <span class="mk">booked call</span>' : ''}${e.deadline ? ' <span class="mk">B+W</span>' : ''}</div>${e.location ? `<div class="small muted">${esc(e.location)}</div>` : ''}</div></div>`;
+  }).join('');
+}
+function renderPulse(waiting) {
+  const p = S.cmd && S.cmd.pulse, parts = [waiting + ' waiting'];
+  if (p && p.hubspot) parts.push(p.hubspot.open + (p.hubspot.open === 1 ? ' conversation open' : ' conversations open'), p.hubspot.proposals + (p.hubspot.proposals === 1 ? ' proposal out' : ' proposals out'));
+  if (p && p.drafts) parts.push(p.drafts + ' drafts in Gmail');
+  if (p && p.apollo_reset_days != null) parts.push('Apollo resets in ' + p.apollo_reset_days + (p.apollo_reset_days === 1 ? ' day' : ' days'));
+  $('#pulseLine').textContent = parts.join(' · ');
+}
+let cmdLoading = false;
+async function loadCommand() {
+  if (cmdLoading) return; cmdLoading = true;
+  try {
+    const [w, t, p] = await Promise.allSettled([api('getWaiting', {}), api('getToday', {}), api('getPulse', {})]);
+    if (w.status !== 'fulfilled') throw w.reason;
+    S.cmd = { waiting: w.value, today: t.status === 'fulfilled' ? t.value : (S.cmd && S.cmd.today) || null, pulse: p.status === 'fulfilled' ? p.value : (S.cmd && S.cmd.pulse) || null, at: Date.now() };
+    await idb.put('kv', S.cmd, 'cmd').catch(() => { });
+  } catch (e) {
+    const c = await idb.get('kv', 'cmd').catch(() => null);
+    if (c && !S.cmd) S.cmd = c;
+    if (S.cmd) S.cmd.stale = true;
+  } finally { cmdLoading = false; }
+  renderWaiting(); renderCal();
+}
+
 // ---------------- log, follow-ups, edit ----------------
 const KIND = { note: 'Note', photo: 'Photo', voice: 'Voice', talk: 'Talked', dropoff: 'Dropped', endday: 'Day wrap', inbound: 'Inbound lead' };
 function capCard(c, pending) {
@@ -758,6 +895,7 @@ function switchView(v) {
   $('#captureFab').hidden = v === 'more';
   if (v === 'map') setTimeout(initMap, 30);
   if (v === 'fu' || v === 'log') loadCaptures();
+  if (v === 'today') loadCommand();
   if (v === 'more') renderSyncChip();
   ls.set('view', v);
 }
@@ -807,10 +945,12 @@ function bindUI() {
   $('#syncNow').onclick = () => sync();
   $('#lockNow').onclick = async () => { ls.del('t'); await idb.del('kv', 'k'); location.reload(); };
   $('#endDayBtn').onclick = endDay;
+  $('#waitList').addEventListener('click', onWaitClick);
   window.addEventListener('online', () => { S.online = true; renderSyncChip(); syncSoon(500); });
   window.addEventListener('offline', () => { S.online = false; renderSyncChip(); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { syncSoon(800); loadPlan(); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { syncSoon(800); loadPlan(); loadCommand(); } });
   setInterval(() => S.outbox.length && sync(), 45000);
+  setInterval(() => { if (!document.hidden) loadCommand(); }, 5 * 60000);
 }
 
 async function start(index) {
@@ -822,7 +962,8 @@ async function start(index) {
   const c = await idb.get('kv', 'caps').catch(() => null); S.caps = Array.isArray(c) ? c : [];
   await refreshOutbox();
   renderCarry();
-  startGps(); loadPlan(); checkBackend(); loadCaptures(); syncSoon(1500);
+  const cc = await idb.get('kv', 'cmd').catch(() => null); if (cc) { S.cmd = cc; S.cmd.stale = true; renderWaiting(); renderCal(); }
+  startGps(); loadPlan(); checkBackend(); loadCaptures(); loadCommand(); syncSoon(1500);
   const v = ls.get('view'); switchView(v && v !== 'more' ? v : 'today');
 }
 

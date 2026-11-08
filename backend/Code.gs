@@ -10,6 +10,8 @@
  *   APOLLO_KEY      optional  Apollo API key, for "Look up in Apollo"
  *   HUBSPOT_TOKEN   optional  HubSpot private app token, for "Add to HubSpot"
  *   SHEET_ID        optional  B+W Field Notes (responses) sheet; captures are mirrored to a "Guide captures" tab
+ *   BOOKING_URL     optional  private appointment-schedule link, used only by "Send booking link" (never put it in the repo)
+ *   PUSH_URL        optional  phase 2: push helper endpoint; PUSH_SECRET its shared secret
  */
 
 const P = PropertiesService.getScriptProperties();
@@ -48,6 +50,12 @@ const ACTIONS = {
   searchPois: (d) => searchPois_(d),
   updateCapture: (d) => updateCapture_(d),
   deleteCapture: (d) => deleteCapture_(d),
+  getWaiting: () => getWaiting_(),
+  markHandled: (d) => markHandled_(d),
+  getToday: () => getToday_(),
+  getPulse: () => getPulse_(),
+  sendBookingLink: (d) => sendBookingLink_(d),
+  bookingText: (d) => ({ text: bookingText_(d.first) }),
 };
 
 // ---------- helpers ----------
@@ -283,62 +291,217 @@ function hubspot_(d) {
   return { configured: true, company_id: id, created: created };
 }
 
-// ---------- inbound leads from Gmail (phone voicemails, website form, website chat) ----------
-// Runs every 15 minutes (installInboundTrigger, once). Files each new lead email as a Field Guide
-// capture (kind "inbound", follow-up "email") so it shows in Follow-ups and the morning drafts.
-// Gmail labels come from DW's filters: Inbound/Phone (Google Voice), Inbound/Website (Squarespace form),
-// Inbound/Chat (HubSpot chat notifications). Each email is filed once (id = gm:<message id>).
+// ---------- inbound leads from Gmail ----------
+// Runs every 15 minutes (installInboundTrigger, once). Files each new lead email as a Field Guide capture
+// (kind "inbound") so it shows in "Waiting on you". Sources:
+//   Inbound/Phone   Google Voice: voicemail → mode "Call", text → "Text", missed call → "Missed call"
+//                   (voicemails come from voice-noreply@google.com, texts from …@txt.voice.google.com)
+//   Inbound/Website Squarespace form → "Website form"   (vendor/sales pitches filed with role "vendor": never buzz)
+//   Inbound/Chat    HubSpot chat notification → "Website chat"
+//   Letter replies  inbox mail from a recipient of a mailed piece (outreach_pieces domain or email) or quoting a ref code → "Letter reply"
+// Each message is filed once (id = gm:<message id>); Voice threads keep growing, so dedupe is by message, not thread.
+const FREEMAIL_ = /@(gmail|yahoo|aol|hotmail|outlook|icloud|me|comcast|verizon|msn|live|protonmail)\./i;
+const REF_RE_ = /\b(PHL1-\d{3}|MA1-\d{3}|NJ1-\d{3}|BAL1-\d{3}|[A-Z0-9]{3}-1103|BOS-HP)\b/;
+const VENDOR_RE_ = /\b(offering (?:a |our )?(?:service|services)|our (?:agency|services) can|seo|web design|lead generation|marketing agency|we help (?:businesses|companies)|partnership opportunity|sponsored post|guest post|recruit(?:er|ing)|staffing|survey invitation|book a demo)\b/i;
+
+function cleanBody_(m) {
+  return String(m.getPlainBody() || '')
+    .replace(/\r/g, '').replace(/\n{3,}/g, '\n\n')
+    .split(/\n(?:YOUR ACCOUNT|HELP CENTER|HELP FORUM|Google LLC|To unsubscribe|You received this|Sent via form submission|On .{5,80} wrote:)/i)[0]
+    .trim().slice(0, 1800);
+}
+function voiceMode_(subj) {
+  if (/voicemail/i.test(subj)) return 'Call';
+  if (/text message|new message|group message/i.test(subj)) return 'Text';
+  if (/missed call/i.test(subj)) return 'Missed call';
+  return null; // welcome / account mail: not a lead
+}
+function outreachIndex_() {
+  const c = CacheService.getScriptCache().get('outreach_idx');
+  if (c) return JSON.parse(c);
+  const rows = bq_('SELECT ref_code, org, recipient_domain, recipient_email FROM ' + T('outreach_pieces') + ' WHERE recipient_domain IS NOT NULL OR recipient_email IS NOT NULL OR ref_code IS NOT NULL', []);
+  const idx = { dom: {}, email: {}, ref: {} };
+  rows.forEach(r => {
+    if (r.recipient_domain && !FREEMAIL_.test('@' + r.recipient_domain)) idx.dom[r.recipient_domain.toLowerCase()] = r.org;
+    if (r.recipient_email) idx.email[r.recipient_email.toLowerCase()] = r.org;
+    if (r.ref_code) idx.ref[r.ref_code] = r.org;
+  });
+  CacheService.getScriptCache().put('outreach_idx', JSON.stringify(idx), 3600);
+  return idx;
+}
+function addrOf_(from) { const m = String(from || '').match(/<([^>]+)>/); return (m ? m[1] : String(from || '')).trim().toLowerCase(); }
+
 function pullInbound() {
-  const filed = GmailApp.getUserLabelByName('FG-filed') || GmailApp.createLabel('FG-filed');
-  const q = '(label:Inbound/Phone OR label:Inbound/Website OR label:Inbound/Chat) -label:FG-filed newer_than:14d';
-  const threads = GmailApp.search(q, 0, 40);
-  let n = 0;
-  threads.forEach(th => {
+  const filedLbl = GmailApp.getUserLabelByName('FG-filed') || GmailApp.createLabel('FG-filed');
+  const me = Session.getActiveUser().getEmail().toLowerCase();
+  const cand = []; // {m, channel, th}
+  // 1. labeled inbound (phone, form, chat)
+  GmailApp.search('(label:Inbound/Phone OR label:Inbound/Website OR label:Inbound/Chat) newer_than:7d', 0, 50).forEach(th => {
     const labels = th.getLabels().map(l => l.getName());
     const channel = labels.indexOf('Inbound/Phone') > -1 ? 'Phone' : labels.indexOf('Inbound/Chat') > -1 ? 'Website chat' : 'Website form';
-    th.getMessages().forEach(m => {
-      const body = String(m.getPlainBody() || '')
-        .replace(/\r/g, '')
-        .replace(/\n{3,}/g, '\n\n')
-        .split(/\n(?:YOUR ACCOUNT|HELP CENTER|Google LLC|To unsubscribe|You received this|Sent via form submission)/i)[0]
-        .trim().slice(0, 1800);
-      const subj = m.getSubject() || '';
-      const phone = ((subj + ' ' + body).match(/\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}/) || [''])[0];
-      const replyTo = m.getReplyTo && m.getReplyTo();
-      // never treat DW's own addresses or system senders as the lead's email; voicemails carry no lead email
-      const notMine = (e) => e && !/@bwimpact\.org$|noreply|no-reply|squarespace|google\.com|hubspot/i.test(e);
-      const bodyEmail = (body.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).filter(notMine)[0] || '';
-      const email = channel === 'Phone' ? '' : (notMine(replyTo) ? replyTo : bodyEmail);
-      const org = ((body.match(/(?:Organization(?: Name)?|Company|Business)\s*[:\n]\s*(.+)/i) || [])[1] || '')
-        .replace(/\*+/g, '').trim().slice(0, 120);
-      const d = m.getDate();
-      saveCapture_({
-        id: 'gm:' + m.getId(),
-        ts: d.toISOString(),
-        local_date: Utilities.formatDate(d, 'America/New_York', 'yyyy-MM-dd'),
-        kind: 'inbound',
-        mode: channel,
-        business_name: org || null,
-        text: channel + ': ' + subj + '\n\n' + body,
-        followup: 'email',
-        contact: [email, phone].filter(Boolean).join(' · ') || null,
-        device: 'gmail'
-      });
-      n++;
-    });
-    th.addLabel(filed);
+    th.getMessages().forEach(m => { if (addrOf_(m.getFrom()) !== me) cand.push({ m: m, channel: channel, th: th }); });
   });
-  return { filed: n };
+  // 2. replies to mailed letters / follow-up emails
+  let idx = null;
+  try { idx = outreachIndex_(); } catch (e) { console.warn('outreach index failed', e); }
+  if (idx) {
+    const doms = Object.keys(idx.dom), ems = Object.keys(idx.email);
+    const parts = doms.map(d => 'from:' + d).concat(ems.map(e => 'from:' + e)).concat(['PHL1', 'MA1', '1103', '"BOS-HP"']);
+    const q = 'in:inbox newer_than:7d -from:me -label:Vendor -label:Inbound/Phone -label:Inbound/Website -label:Inbound/Chat {' + parts.join(' ') + '}';
+    GmailApp.search(q, 0, 30).forEach(th => th.getMessages().forEach(m => {
+      const a = addrOf_(m.getFrom());
+      if (a === me || /@bwimpact\.org$/.test(a)) return;
+      const dom = a.split('@')[1] || '';
+      const hay = (m.getSubject() || '') + '\n' + String(m.getPlainBody() || '').slice(0, 4000);
+      const ref = (hay.match(REF_RE_) || [])[1];
+      const org = idx.email[a] || (!FREEMAIL_.test(a) && idx.dom[dom]) || (ref && idx.ref[ref]);
+      if (org) cand.push({ m: m, channel: 'Letter reply', th: th, org: org, ref: ref });
+    }));
+  }
+  if (!cand.length) return { filed: 0 };
+  // dedupe against what is already filed
+  const ids = cand.map(c => 'gm:' + c.m.getId());
+  const seen = {};
+  bq_('SELECT id FROM ' + T('field_captures') + ' WHERE id IN UNNEST(@ids)', [p_('ids', 'STRING', ids)]).forEach(r => seen[r.id] = 1);
+  const fresh = [];
+  cand.forEach(c => {
+    const id = 'gm:' + c.m.getId();
+    if (seen[id]) return; seen[id] = 1;
+    const m = c.m, subj = m.getSubject() || '', body = cleanBody_(m);
+    let mode = c.channel, role = null;
+    if (c.channel === 'Phone') { mode = voiceMode_(subj); if (!mode) return; }
+    if (c.channel === 'Website form' && VENDOR_RE_.test(body)) role = 'vendor';
+    const phone = ((subj + ' ' + body).match(/\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}/) || [''])[0];
+    const replyTo = m.getReplyTo && m.getReplyTo();
+    const notMine = (e) => e && !/@bwimpact\.org|noreply|no-reply|squarespace|google\.com|hubspot/i.test(e);
+    const bodyEmail = (body.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).filter(notMine)[0] || '';
+    let email = '';
+    if (c.channel === 'Letter reply') email = addrOf_(m.getFrom());
+    else if (c.channel !== 'Phone') email = notMine(replyTo) ? replyTo : bodyEmail;
+    const org = c.org || ((body.match(/(?:Organization(?: Name)?|Company|Business)\s*[:\n]\s*(.+)/i) || [])[1] || '').replace(/\*+/g, '').trim().slice(0, 120);
+    const d = m.getDate();
+    const label = { Call: 'Voicemail', Text: 'Text', 'Missed call': 'Missed call', 'Website form': 'Website form', 'Website chat': 'Website chat', 'Letter reply': 'Reply to letter' }[mode];
+    saveCapture_({
+      id: id, ts: d.toISOString(), local_date: Utilities.formatDate(d, 'America/New_York', 'yyyy-MM-dd'),
+      kind: 'inbound', mode: mode, role: role, business_name: org || null,
+      business_ref: c.ref || null,
+      text: label + ': ' + subj + (body ? '\n\n' + body : ''),
+      followup: mode === 'Missed call' ? 'call' : (mode === 'Text' ? 'text' : 'email'),
+      contact: [email, phone].filter(Boolean).join(' · ') || null,
+      device: 'gmail'
+    });
+    c.th.addLabel(filedLbl);
+    fresh.push({ id: id, mode: mode, org: org, vendor: role === 'vendor', subj: subj });
+  });
+  if (fresh.length) notifyLeads_(fresh);
+  return { filed: fresh.length };
 }
-// Run once from the editor to schedule pullInbound every 15 minutes (asks for Gmail permission the first time).
+// Run once from the editor to schedule pullInbound every 15 minutes.
 function installInboundTrigger() {
   ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'pullInbound').forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('pullInbound').timeBased().everyMinutes(15).create();
   return pullInbound();
 }
 
+// ---------- buzz (phase 2 hook) ----------
+// Quiet hours live here: weekdays 10:00–18:00 ET only; anything outside is dropped (it still sits in the list).
+// Sends only if PUSH_URL (+ PUSH_SECRET) is set; until then this is a no-op.
+function inWorkHours_(d) {
+  const dow = Number(Utilities.formatDate(d || new Date(), 'America/New_York', 'u')); // 1=Mon … 7=Sun
+  const h = Number(Utilities.formatDate(d || new Date(), 'America/New_York', 'H'));
+  return dow <= 5 && h >= 10 && h < 18;
+}
+function notifyLeads_(items) {
+  const buzz = items.filter(i => !i.vendor && i.mode !== 'Missed call');
+  if (!buzz.length || !inWorkHours_()) return;
+  const url = P.getProperty('PUSH_URL'); if (!url) return;
+  const title = buzz.length > 1 ? buzz.length + ' new leads' : ({ Call: 'Voicemail', Text: 'Text', 'Website form': 'Website form', 'Website chat': 'Website chat', 'Letter reply': 'Reply to your letter' }[buzz[0].mode] || 'New lead');
+  const body = buzz.map(i => i.org || i.subj).filter(Boolean).join(' · ').slice(0, 140) || 'Open the Field Guide';
+  try {
+    UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+      headers: { 'X-Push-Secret': P.getProperty('PUSH_SECRET') || '' }, payload: JSON.stringify({ title: title, body: body, url: './#today' }) });
+  } catch (e) { console.warn('push failed', e); }
+}
+
+// ---------- command center: Waiting on you ----------
+function getWaiting_() {
+  const caps = bq_('SELECT id, ts, local_date, kind, mode, role, business_name, area_name, text, followup, contact FROM ' + T('field_captures') +
+    ' WHERE NOT IFNULL(followup_done, FALSE) AND ((kind = "inbound" AND local_date >= DATE_SUB(CURRENT_DATE("America/New_York"), INTERVAL 30 DAY))' +
+    ' OR (kind != "inbound" AND followup != "none" AND local_date >= DATE_SUB(CURRENT_DATE("America/New_York"), INTERVAL 1 DAY))) ORDER BY ts DESC LIMIT 60', []);
+  const pieces = bq_('SELECT row_id, ref_code, batch, lane, org, addressed_to, city, state, status, mailed_date, followup_due, notes, recipient_email FROM ' + T('outreach_pieces') +
+    ' WHERE NOT handled AND followup_due <= CURRENT_DATE("America/New_York") AND NOT STARTS_WITH(status, "Built")' +
+    ' AND (lane LIKE "District%" OR recipient_email IS NOT NULL) ORDER BY followup_due, org LIMIT 40', []);
+  return { captures: caps, pieces: pieces, as_of: new Date().toISOString() };
+}
+function markHandled_(d) {
+  if (d.type === 'piece') {
+    bq_('UPDATE ' + T('outreach_pieces') + ' SET handled = TRUE, handled_at = CURRENT_TIMESTAMP(), next_step = IFNULL(@n, next_step) WHERE row_id = @id',
+      [p_('id', 'INT64', d.id), p_('n', 'STRING', d.note || null)]);
+  } else {
+    bq_('UPDATE ' + T('field_captures') + ' SET followup_done = TRUE, followup_done_ts = CURRENT_TIMESTAMP(), text = IF(@n IS NULL, text, CONCAT(IFNULL(text, ""), "\\n[", @n, "]")) WHERE id = @id',
+      [p_('id', 'STRING', d.id), p_('n', 'STRING', d.note || null)]);
+  }
+  return { id: d.id, handled: true };
+}
+
+// ---------- command center: calendar ----------
+function getToday_() {
+  const now = new Date(), until = new Date(now.getTime() + 36 * 3600 * 1000);
+  const cals = [CalendarApp.getDefaultCalendar()].concat(CalendarApp.getCalendarsByName('Brown + Wheaten'));
+  const out = [];
+  cals.forEach((cal, ci) => cal.getEvents(now, until).forEach(ev => {
+    if (ev.getMyStatus && ev.getMyStatus() === CalendarApp.GuestStatus.NO) return;
+    const desc = ev.getDescription() || '';
+    out.push({ title: ev.getTitle(), start: ev.getStartTime().toISOString(), end: ev.getEndTime().toISOString(), all_day: ev.isAllDayEvent(),
+      location: ev.getLocation() || '', booked: /booked by|appointment schedul/i.test(desc + ' ' + ev.getTitle()), deadline: ci > 0 });
+  }));
+  out.sort((a, b) => a.start < b.start ? -1 : 1);
+  return { events: out.slice(0, 12) };
+}
+
+// ---------- command center: pulse ----------
+function getPulse_() {
+  const cache = CacheService.getScriptCache(), hit = cache.get('pulse');
+  if (hit) return JSON.parse(hit);
+  const out = { hubspot: null, drafts: null, apollo_reset_days: null };
+  // Apollo: credits reset on the 16th of each month
+  const now = new Date(), y = now.getFullYear(), mo = now.getMonth();
+  let reset = new Date(y, mo, 16); if (now >= reset) reset = new Date(y, mo + 1, 16);
+  out.apollo_reset_days = Math.ceil((reset - now) / 86400000);
+  try { out.drafts = GmailApp.search('in:draft newer_than:2d', 0, 50).length; } catch (e) { }
+  if (P.getProperty('HUBSPOT_TOKEN')) {
+    try {
+      const n = (vals) => hs_('post', '/crm/v3/objects/contacts/search', { filterGroups: [{ filters: [{ propertyName: 'bw_status', operator: 'IN', values: vals }] }], limit: 1 }).total || 0;
+      out.hubspot = { open: n(['Replied', 'Talked']), proposals: n(['Proposal']), clients: n(['Client']) };
+    } catch (e) { console.warn('pulse hubspot', e); }
+  }
+  cache.put('pulse', JSON.stringify(out), 900);
+  return out;
+}
+
+// ---------- command center: send booking link ----------
+// The booking URL lives only in Script Properties (BOOKING_URL); never in the app or repo.
+function bookingText_(first) {
+  const url = P.getProperty('BOOKING_URL');
+  if (!url) throw new Error('BOOKING_URL not set in Script Properties');
+  return (first ? 'Hi ' + first + ',\n\n' : 'Hi there,\n\n') +
+    'Thanks for reaching out to Brown + Wheaten. Here\'s a link to pick a 30-minute slot that works for you: ' + url +
+    '\n\nIf none of those fit, reply with a couple of times and we\'ll make one work.\n\nDarryl';
+}
+function sendBookingLink_(d) {
+  const to = String(d.to || '').trim();
+  if (!/^[^\s@,;]+@[^\s@,;]+\.[a-z]{2,}$/i.test(to)) throw new Error('no valid email for this lead');
+  if (/@bwimpact\.org$/i.test(to)) throw new Error('that is your own address');
+  const first = String(d.first || '').trim().split(/\s+/)[0].replace(/[^A-Za-z'’-]/g, '').slice(0, 30);
+  MailApp.sendEmail({ to: to, subject: 'Finding a time to talk', body: bookingText_(first), name: 'Darryl Wooten' });
+  markHandled_({ type: d.type, id: d.id, note: 'booking link sent to ' + to + ' ' + Utilities.formatDate(new Date(), 'America/New_York', 'MMM d h:mm a') });
+  return { sent: true, to: to };
+}
+
 // Run once from the editor (Run → authorize) to grant BigQuery, Drive, Sheets and external-request access.
 function authorize() {
   Logger.log(bq_('SELECT COUNT(*) n FROM ' + T('field_captures'), []));
   Logger.log(DriveApp.getRootFolder().getName());
+  Logger.log(CalendarApp.getDefaultCalendar().getName());
+  Logger.log(MailApp.getRemainingDailyQuota());
 }

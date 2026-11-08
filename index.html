@@ -14,7 +14,7 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="stylesheet" href="vendor/leaflet.css">
-<link rel="stylesheet" href="style.css?v=3">
+<link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
 
@@ -53,6 +53,15 @@
         <input id="bizSearch" type="search" placeholder="Search: a business, street or type (e.g. coffee)" autocomplete="off" autocapitalize="none" enterkeyhint="search" aria-label="Search businesses">
         <div id="bizResults" class="list tight"></div>
       </div>
+      <div id="waitCard" class="card wait">
+        <div class="row between"><div class="eyebrow">Waiting on you</div><span id="waitAsOf" class="small muted"></span></div>
+        <div id="waitList" class="wlist"><p class="muted small">Loading…</p></div>
+      </div>
+      <div id="calCard" class="card cal">
+        <div class="row between"><div class="eyebrow">Today</div><a class="small link" href="https://calendar.google.com/calendar/r/day" target="_blank" rel="noopener">Calendar</a></div>
+        <div id="calList"></div>
+      </div>
+      <p id="pulseLine" class="pulse"></p>
       <div id="whereCard" class="card where">
         <div class="where-head">
           <div>
@@ -265,6 +274,6 @@
 <div id="toast" class="toast" role="status" hidden></div>
 
 <script src="vendor/leaflet.js"></script>
-<script src="app.js?v=7"></script>
+<script src="app.js?v=8"></script>
 </body>
 </html>
