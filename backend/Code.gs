@@ -305,9 +305,12 @@ function pullInbound() {
       const subj = m.getSubject() || '';
       const phone = ((subj + ' ' + body).match(/\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}/) || [''])[0];
       const replyTo = m.getReplyTo && m.getReplyTo();
-      const email = (replyTo && replyTo.indexOf('@') > -1 && !/noreply|no-reply|squarespace|google\.com|hubspot/i.test(replyTo)) ? replyTo
-        : ((body.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [''])[0]);
-      const org = ((body.match(/(?:Organization(?: Name)?|Company|Business)\s*[:\n]\s*(.+)/i) || [])[1] || '').trim().slice(0, 120);
+      // never treat DW's own addresses or system senders as the lead's email; voicemails carry no lead email
+      const notMine = (e) => e && !/@bwimpact\.org$|noreply|no-reply|squarespace|google\.com|hubspot/i.test(e);
+      const bodyEmail = (body.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).filter(notMine)[0] || '';
+      const email = channel === 'Phone' ? '' : (notMine(replyTo) ? replyTo : bodyEmail);
+      const org = ((body.match(/(?:Organization(?: Name)?|Company|Business)\s*[:\n]\s*(.+)/i) || [])[1] || '')
+        .replace(/\*+/g, '').trim().slice(0, 120);
       const d = m.getDate();
       saveCapture_({
         id: 'gm:' + m.getId(),
