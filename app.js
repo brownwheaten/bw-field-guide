@@ -4,7 +4,7 @@
    Storefronts come from the backend in 0.02° tiles (OSM via BigQuery) and are cached on the device.
    Captures and plans live in BigQuery via the Apps Script backend; captures wait in IndexedDB until sent. */
 'use strict';
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.6.1';
 const TZ = 'America/New_York';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -1055,13 +1055,23 @@ function renderSearch(q, tok, state) {
 function switchView(v) {
   $$('.view').forEach(el => el.hidden = el.id !== 'v-' + v);
   $$('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.v === v));
-  $('#topTitle').textContent = { today: 'Today', map: 'Map', log: 'Log', fu: 'Follow-ups', more: 'More' }[v];
-  $('#captureFab').hidden = v === 'more';
+  $('#topTitle').textContent = { today: 'Today', map: 'Map', places: 'Places', log: 'Log', fu: 'Follow-ups', more: 'More' }[v];
+  $('#captureFab').hidden = v === 'more' || v === 'places';
+  if (v === 'places') openPlaces();
   if (v === 'map') setTimeout(initMap, 30);
   if (v === 'fu' || v === 'log') loadCaptures();
   if (v === 'today') loadCommand();
   if (v === 'more') { renderSyncChip(); renderPush().catch(() => { }); }
   ls.set('view', v);
+}
+// Places (phase 1) lives in places-core.js and places.js, loaded the first time the tab opens, so a Places problem cannot break the other tabs.
+let placesLoading = null;
+function loadScript(src) { return new Promise((res, rej) => { const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => rej(new Error('load ' + src)); document.head.appendChild(el); }); }
+async function openPlaces() {
+  try {
+    if (!window.BWPlaces) { placesLoading = placesLoading || loadScript('places-core.js?v=2').then(() => loadScript('places.js?v=2')); await placesLoading; }
+    await window.BWPlaces.open({ S, api, idb, esc, toast });
+  } catch (e) { console.warn('places', e); placesLoading = null; $('#placesRoot').innerHTML = '<div class="card"><b>Places could not load.</b><p class="muted small">' + esc(e.message) + '. The other tabs are unaffected.</p></div>'; }
 }
 function closeSheets() { $$('.sheet').forEach(s => s.hidden = true); }
 let toastT; function toast(t) { const el = $('#toast'); el.textContent = t; el.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => el.hidden = true, 2600); }

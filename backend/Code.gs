@@ -12,6 +12,10 @@
  *   SHEET_ID        optional  B+W Field Notes (responses) sheet; captures are mirrored to a "Guide captures" tab
  *   BOOKING_URL     optional  private appointment-schedule link, used only by "Send booking link" (never put it in the repo)
  *   PUSH_URL        optional  push helper (Cloud Run) URL; PUSH_SECRET its shared secret; PUSH_SUBS is written by the app
+ *   PLACES_FOLDER_ID          ID of the Drive folder holding the Places snapshot files (places_*.json.gz). Set it here by hand
+ *                             (or paste it into PLACES_FOLDER_ID_DEFAULT below in the live script only, never in the public repo).
+ *                             If neither is set, or the folder is in the trash, the backend falls back to your own folder named
+ *                             "B+W Places snapshots" (not in the trash; the oldest if there are two) and saves its ID here.
  */
 
 const P = PropertiesService.getScriptProperties();
@@ -61,7 +65,56 @@ const ACTIONS = {
   testPush: () => push_('Field Guide test', 'Buzz works on this device. Real buzzes only come weekdays 10–6.', { force: true, tag: 'test' }),
   getFieldWalks: () => getFieldWalks_(),
   pushStatus: () => ({ configured: !!P.getProperty('PUSH_URL'), devices: subs_().map(s => s.device) }),
+  placesList: () => placesList_(),
+  placesFile: (d) => placesFile_(d),
 };
+
+// ---------- Places (phase 1): snapshot files from Drive. Read-only; the files are built by bw_out/tools/places_export.
+// Only files that are not in the trash are served. If Drive holds two files of one name, the most recently updated one is
+// served (ties broken by file ID), so a refresh never serves the older copy.
+const PLACES_FOLDER_ID_DEFAULT = '';   // optional: paste the folder ID here in the live script (keep it out of the public repo)
+const PLACES_NAME_ = /^places_[A-Za-z0-9_]+\.json\.gz$/;
+function placesFolder_() {
+  const id = P.getProperty('PLACES_FOLDER_ID') || PLACES_FOLDER_ID_DEFAULT;
+  if (id) {
+    try { const f = DriveApp.getFolderById(id); if (!f.isTrashed()) return f; } catch (e) { }
+  }
+  // fallback: a folder of that name that is not in the trash, owned by the account the script runs as (not one shared by others)
+  const me = Session.getEffectiveUser().getEmail();
+  const found = [];
+  const it = DriveApp.getFoldersByName('B+W Places snapshots');
+  while (it.hasNext()) {
+    const f = it.next(); if (f.isTrashed()) continue;
+    let own = false; try { own = !!f.getOwner() && f.getOwner().getEmail() === me; } catch (e) { }
+    if (own) found.push(f);
+  }
+  if (!found.length) throw new Error('places_folder_missing');
+  found.sort((a, b) => a.getDateCreated() - b.getDateCreated() || (a.getId() < b.getId() ? -1 : 1));
+  if (!P.getProperty('PLACES_FOLDER_ID')) P.setProperty('PLACES_FOLDER_ID', found[0].getId());
+  return found[0];
+}
+const placesNewer_ = (a, b) => (b.getLastUpdated() - a.getLastUpdated()) || (a.getId() < b.getId() ? -1 : 1);   // sort: newest first
+function placesList_() {
+  const by = {}; const it = placesFolder_().getFiles();
+  while (it.hasNext()) {
+    const f = it.next(); if (f.isTrashed() || !PLACES_NAME_.test(f.getName())) continue;
+    (by[f.getName()] = by[f.getName()] || []).push(f);
+  }
+  const out = Object.keys(by).sort().map(n => {
+    const fs = by[n].sort(placesNewer_); const f = fs[0];
+    return { name: n, size: f.getSize(), updated: f.getLastUpdated().toISOString(), copies: fs.length };
+  });
+  return { files: out };
+}
+function placesFile_(d) {
+  const name = String(d.name || '');
+  if (!PLACES_NAME_.test(name)) throw new Error('bad_name');
+  const fs = []; const it = placesFolder_().getFilesByName(name);
+  while (it.hasNext()) { const f = it.next(); if (!f.isTrashed()) fs.push(f); }
+  if (!fs.length) throw new Error('places_file_missing: ' + name);
+  const f = fs.sort(placesNewer_)[0];
+  return { name, updated: f.getLastUpdated().toISOString(), size: f.getSize(), copies: fs.length, b64: Utilities.base64Encode(f.getBlob().getBytes()) };
+}
 
 // ---------- helpers ----------
 function json_(o) {
