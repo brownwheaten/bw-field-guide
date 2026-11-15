@@ -37,3 +37,17 @@ what's opening and closing, property and money, food access and a small health s
 - `test/places_gate.mjs` also checks the new files against the phase 1 tract file and the packets' jobs and transit figures and the district
   tables; phase 1 and 2a checks are unchanged.
 - The new snapshot files, like the rest, are built outside this repository and kept in the owner's Google Drive.
+
+## Places phase 2, final pass (branch `places-v4`, app 1.9.0; stacked on phases 2a and 2b)
+
+- Review fixes for phase 2a: snapshot files are versioned (the meta lists each file's sha256 and a revision; a saved copy that differs from the
+  one in Drive is fetched again, and an older app's meta or area file is never trusted while there is signal); permit sentences obey CL-19;
+  address rules use the packet builder's own matcher (CL-36, CL-38); deeds count once per deed with medians on single-property deeds; meeting
+  mode never shows a run that ends below its start and labels the part year; SBA counts made by map position are floors ("at least N").
+- County card (QCEW employment and pay by sector, LAUS unemployment, CRA small-business lending, business ownership, Map the Meal Gap, the Food
+  Environment Atlas, farms), ZIP extras (CDC PLACES by ZIP, the decade change where the ZIP area did not change, ZIP outlines, jobs by ZIP in
+  Pennsylvania), address search (Philadelphia from the saved parcels; elsewhere the backend action `placesGeocode`), a side-by-side view of two
+  pinned places (internal), and meeting mode with two settings (district meeting, food-access meeting).
+- `backend/Code.gs`: the read-only `placesGeocode` action (the City property file in the warehouse for Philadelphia; the Census Bureau's public
+  geocoder, no key, elsewhere).
+- `test/places_gate.mjs`: a "final pass" block checks the fixes against references kept outside the repo.

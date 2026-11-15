@@ -15,19 +15,32 @@
   const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
   /** undo the export's delta encoding (enc[k] === 'd': running sum over non-null values; nulls stay null) */
+  /** a numeric column with no nulls becomes a typed array (review 2a, defect 8: about a quarter of the memory of a plain array). One pass. */
+  function typed(a) {
+    const n = a.length; const out = new Int32Array(n);
+    for (let i = 0; i < n; i++) { const v = a[i]; if (typeof v !== 'number') return a; if ((v | 0) !== v) return Float64Array.from(a); out[i] = v; }
+    return out;
+  }
   function decodeCols(cols) {
     const enc = cols._enc || {}; const out = {};
     for (const [k, a] of Object.entries(cols)) {
       if (k === '_enc') continue;
-      if (enc[k] !== 'd') { out[k] = a; continue; }
-      const b = new Array(a.length); let run = 0;
-      for (let i = 0; i < a.length; i++) { const v = a[i]; if (v === null) b[i] = null; else { run += v; b[i] = run; } }
-      out[k] = b;
+      if (enc[k] !== 'd') { out[k] = typed(a); continue; }
+      // delta-encoded: decode straight into an Int32Array; a null (or a value past 32 bits) falls back to a plain array
+      const n = a.length; let b = new Int32Array(n), run = 0, plain = null;
+      for (let i = 0; i < n; i++) {
+        const v = a[i];
+        if (plain) { if (v === null) plain[i] = null; else { run += v; plain[i] = run; } continue; }
+        if (v === null || (run + v) !== ((run + v) | 0)) { plain = new Array(n); for (let j = 0; j < i; j++) plain[j] = b[j]; b = null; i--; continue; }
+        run += v; b[i] = run;
+      }
+      out[k] = plain || b;
     }
     return out;
   }
   function layer(data, name) {
     const c = decodeCols(data.cols); const n = (c.y || c.st).length;
+    data.cols = null;   // the plain arrays are not kept once decoded (review 2a, defect 8)
     return { name, n, c, data, byStreet: null, byTract: null };
   }
   /** R: the decoded record set. files: {meta, lic, permits, parcels, sales, small} as parsed JSON */
@@ -44,15 +57,25 @@
   }
 
   // ---------------------------------------------------------------- selecting records
-  /** street ids whose text is the part's street, the street followed by more words (a unit), or, for a part with no
-   *  direction, the street with a leading direction letter (the builder's regex allowed "N LANCASTER AVE") */
+  /** the packet builder's rule-part matcher (CL-36, templates/builder/lib/records.py _part_rx), on street text already parsed by the same
+   *  normalizer at export: a part that names a direction requires it; a part without one accepts any direction or none; the street type may be
+   *  missing at the end ("1001 S 9TH"). A street whose whole name is a direction word ("S ST", South Street) is matched exactly. */
+  const TYPES = ['ST', 'AVE', 'SQ', 'RD', 'BLVD', 'PL', 'DR', 'LN', 'WAY', 'PIKE'];
+  const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function partRx(part) {
+    if (/^[NSEW] (ST|AVE)$/.test(part)) return new RegExp('^' + part + '$');
+    const toks = part.split(' ').filter(Boolean);
+    const d = toks.length > 1 && ['N', 'S', 'E', 'W'].includes(toks[0]) ? toks[0] : null;
+    const body = d ? toks.slice(1) : toks;
+    const sfx = body.length && TYPES.includes(body[body.length - 1]);
+    const pre = d ? reEsc(d) + ' ' : '(?:[NSEW] )?';
+    if (sfx) return new RegExp('^' + pre + reEsc(body.slice(0, -1).join(' ')) + '(?: ' + body[body.length - 1] + '\\b|$)');
+    return new RegExp('^' + pre + reEsc(body.join(' ')) + '(?: (?:' + TYPES.join('|') + '))?\\b');
+  }
   function streetIds(R, part) {
     if (R.partCache.has(part)) return R.partCache.get(part);
-    const ids = new Set(); const hasDir = DIRS.includes(part.slice(0, 2));
-    R.streets.forEach((s, i) => {
-      if (s === part || s.startsWith(part + ' ')) ids.add(i);
-      else if (!hasDir && DIRS.includes(s.slice(0, 2)) && (s.slice(2) === part || s.slice(2).startsWith(part + ' '))) ids.add(i);
-    });
+    const ids = new Set(); const rx = partRx(part);
+    R.streets.forEach((s, i) => { if (rx.test(s)) ids.add(i); });
     R.partCache.set(part, ids); return ids;
   }
   function byStreet(Ly) {
@@ -159,7 +182,7 @@
       steady: steady(vals), top_address: top.key, top_address_n: top.n, top_share: five ? top.n / five : 0, zoning_admin_share: five ? zoningAdmin / five : 0,
       types: Object.entries(typeN).map(([t, n]) => [Ly.data.types[t], n]).sort((a, b) => b[1] - a[1]), commercial: crN[1], residential: crN[2],
       gates: { G3: five >= 100 ? 'pass' : `FAIL: ${five} over five years (needs 100)`, G5: five && top.n / five > 0.5 ? `FAIL: one address holds ${Math.round(top.n / five * 100)}%` : 'pass',
-        G7: W ? (ytdThis >= 0.9 * ytdLast ? 'pass' : `hold the year to date: ${ytdThis} against ${ytdLast}`) : 'pass' },
+        G7: W ? (ytdThis >= 0.9 * ytdLast ? 'pass' : `FAIL: year to date under 90% of last year (${ytdThis} against ${ytdLast})`) : 'pass' },
       unplaced: unplaced(R, 'permits', idx) };
   }
   function licenses(R, idx) {
@@ -187,14 +210,17 @@
     const keep = idx.filter(i => !c.mb[i]); const since = keep.filter(i => c.fy[i] >= 2020);
     const keys = since.map(i => c.ak[i]); const top = topOf(keys);
     const amt = since.map(i => c.amt[i]); const tot = amt.reduce((a, b) => a + b, 0); const mx = amt.length ? Math.max(...amt) : 0;
+    // spec G5 for dollars is by address (review 2a, defect 10): the largest sum at one address against one third of the total
+    const byAddr = new Map(); for (const i of since) byAddr.set(c.ak[i], (byAddr.get(c.ak[i]) || 0) + c.amt[i]);
+    let mxA = 0; for (const v of byAddr.values()) if (v > mxA) mxA = v;
     const byFy = {}; for (const i of since) byFy[c.fy[i]] = (byFy[c.fy[i]] || 0) + 1;
     const latest = since.length ? ymd(Math.max(...since.map(i => c.d[i]))) : null;
     const pass = since.length >= 5 && top.distinct >= 4;
     return { kind: 'loans', as_of: R.small.sba.as_of, n_since_fy2020: since.length, k_addresses: top.distinct, top_address_n: top.n,
-      top_address: top.key !== null ? R.small.sba.addr_keys[top.key] : null, latest, dollars_since: tot, top_loan_dollar_share: tot ? mx / tot : null, by_fy: byFy,
+      top_address: top.key !== null ? R.small.sba.addr_keys[top.key] : null, latest, dollars_since: tot, top_loan_dollar_share: tot ? mx / tot : null, top_address_dollar_share: tot ? mxA / tot : null, by_fy: byFy,
       mailbox_dropped: idx.length - keep.length, program_504: since.filter(i => c.p[i] === 1).length,
       gates: { G3: pass ? 'pass' : `FAIL: ${since.length} loans at ${top.distinct} addresses (needs 5 at 4)`, G5_count: since.length && top.n / since.length > 1 / 3 ? `FAIL: one address holds ${top.n} of ${since.length}` : 'pass',
-        G5_dollars: tot && mx / tot > 1 / 3 ? `FAIL: one loan is ${Math.round(mx / tot * 100)}% of the dollars` : 'pass' },
+        G5_dollars: tot && mxA / tot > 1 / 3 ? `FAIL: one address holds ${Math.round(mxA / tot * 100)}% of the dollars` : 'pass' },
       unplaced: unplaced(R, 'sba', idx) };
   }
   function grants(R, idx) {
@@ -223,15 +249,23 @@
         G5_value: nrVal && topVal / nrVal > 0.5 ? `FAIL: ${k10} of ${vals.length} non-residential properties hold ${Math.round(topVal / nrVal * 100)}% of the value` : 'pass' },
       unplaced: unplaced(R, 'parcels', idx) };
   }
+  /** deeds (review 2a, defect 4): a deed covering several properties is one row per property, each carrying the whole price; it is counted
+   *  once (same date, price and property count), and the median price is taken over single-property deeds only, shown from 5 deeds a year */
   function sales(R, idx) {
-    const c = R.L.sales.c; const by = {}, sheriff = {}, prices = {}; const nonres = new Set(R.L.parcels ? R.L.parcels.data.nonres.map(Number) : []); let nrN = 0;
+    const c = R.L.sales.c; const docs = {}, sheriff = {}, prices = {}, rows = {}; const nonres = new Set(R.L.parcels ? R.L.parcels.data.nonres.map(Number) : []); const nrDocs = new Set();
     for (const i of idx) {
       const y = yearOf(c.d[i]);
-      if (c.k[i] === 1) { sheriff[y] = (sheriff[y] || 0) + 1; continue; }
-      by[y] = (by[y] || 0) + 1; (prices[y] ||= []).push(c.amt[i]); if (nonres.has(c.c[i])) nrN++;
+      const multi = c.pc[i] > 1; const key = multi ? `${c.d[i]}|${c.amt[i]}|${c.pc[i]}` : 'r' + i;
+      if (c.k[i] === 1) { (sheriff[y] ||= new Set()).add(key); continue; }
+      (docs[y] ||= new Set()).add(key); rows[y] = (rows[y] || 0) + 1;
+      if (!multi) (prices[y] ||= []).push(c.amt[i]);
+      if (nonres.has(c.c[i])) nrDocs.add(key);
     }
-    const med = {}; for (const [y, a] of Object.entries(prices)) { a.sort((p, q) => p - q); const m = a.length; med[y] = m % 2 ? a[(m - 1) / 2] : (a[m / 2 - 1] + a[m / 2]) / 2; }
-    return { kind: 'sales', as_of: R.L.sales.data.as_of, by_year: by, median_price: med, sheriff_by_year: sheriff, nonres_sales: nrN, unplaced: unplaced(R, 'sales', idx) };
+    const by = {}; for (const [y, s] of Object.entries(docs)) by[y] = s.size;
+    const sh = {}; for (const [y, s] of Object.entries(sheriff)) sh[y] = s.size;
+    const med = {}, single = {};
+    for (const [y, a] of Object.entries(prices)) { single[y] = a.length; if (a.length < 5) continue; a.sort((p, q) => p - q); const m = a.length; med[y] = m % 2 ? a[(m - 1) / 2] : (a[m / 2 - 1] + a[m / 2]) / 2; }
+    return { kind: 'sales', as_of: R.L.sales.data.as_of, by_year: by, property_rows: rows, median_price: med, single_deeds: single, sheriff_by_year: sh, nonres_sales: nrDocs.size, unplaced: unplaced(R, 'sales', idx) };
   }
   /** everything for one selection; layers not loaded come back null */
   function summarize(R, sel) {
@@ -244,10 +278,19 @@
   function permitsSay(p, where) {
     const c = (n) => Number(n).toLocaleString('en-US');
     const lead = p.steady.steady ? `About ${c(p.steady.avg10)} City permits a year at ${where}.` : `${c(p.five)} City permits in five years at ${where}.`;
-    const ytd = p.ytd && p.gates.G7 === 'pass' ? ` Through ${p.ytd.through} ${p.ytd.year} it issued ${c(p.ytd.this)}, against ${c(p.ytd.last)} at the same point in ${p.ytd.year - 1}.` : '';
+    // the year-to-date sentence only when this year is not behind (review 2a, defect 5): within 10% behind passes G7 but still reads as a fall
+    const ytd = p.ytd && p.gates.G7 === 'pass' && p.ytd.this >= p.ytd.last ? ` Through ${p.ytd.through} ${p.ytd.year} it issued ${c(p.ytd.this)}, against ${c(p.ytd.last)} at the same point in ${p.ytd.year - 1}.` : '';
     return { lead, support: `The City issued ${p.steady.steady ? c(p.five) : 'them'} from 2021 through 2025.` + ytd };
   }
-  const Records = { permitsSay, decodeCols, load, select, summarize, permits, licenses, loans, grants, property, sales, steady, ytdWindow, directionAllowed, streetIds, addrText, ymd, dayOf, VERSION: '2.0.0' };
+  /** CL-19 / G7 with G3 and G5: a copy-ready permit sentence only when all three pass (review 2a, defect 2) */
+  const permitSayOK = (p) => !!p && p.gates.G3 === 'pass' && p.gates.G5 === 'pass' && p.gates.G7 === 'pass';
+  /** an SBA count made by map position (district, tract, circle) leaves out loans that could not be placed: a floor (review 2a, defect 6) */
+  function unplacedSbaShare(R) {
+    const c = R.L.sba.c; let n = 0, u = 0;
+    for (let i = 0; i < R.L.sba.n; i++) { if (c.mb[i] || c.fy[i] < 2020) continue; n++; if (c.y[i] === null) u++; }
+    return { n, unplaced: u, share: n ? u / n : 0 };
+  }
+  const Records = { partRx, permitsSay, permitSayOK, unplacedSbaShare, decodeCols, load, select, summarize, permits, licenses, loans, grants, property, sales, steady, ytdWindow, directionAllowed, streetIds, addrText, ymd, dayOf, VERSION: '2.1.0' };
   if (typeof module !== 'undefined' && module.exports) module.exports = Records;
   else root.BWPlacesRecords = Records;
 })(typeof window !== 'undefined' ? window : globalThis);

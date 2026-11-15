@@ -8,9 +8,9 @@
   const C = window.BWPlacesCore;
   const RC = window.BWPlacesRecords;   // places-records.js (phase 2): Philadelphia address records
   const WK = window.BWPlacesWork;      // places-work.js (phase 2b): jobs and commuting, transit, food extras
-  const PV = '1.3.0';
+  const PV = '1.4.0';
   let X = null;                       // context from app.js: { S, api, idb, esc, toast }
-  const P = { mem: {}, tracts: {}, geo: {}, cmpCache: {}, meeting: false, place: null, map: null, status: {}, busy: new Map(), radius: 805 };
+  const P = { mem: {}, tracts: {}, geo: {}, zgeo: {}, cmpCache: {}, meeting: '', expect: {}, pins: [], place: null, map: null, status: {}, busy: new Map(), radius: 805 };
   const ST_FIPS = { '09': 'CT', '10': 'DE', '24': 'MD', '25': 'MA', '34': 'NJ', '36': 'NY', '42': 'PA', '44': 'RI' };
   const HOME = ['PA', 'NJ', 'DE'];
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -33,10 +33,14 @@
     return JSON.parse(txt);
   }
   const b64ToBytes = (b) => Uint8Array.from(atob(b), c => c.charCodeAt(0));
-  const devSrc = () => ls.get('places_src');       // developer/test only: a URL folder holding the snapshot files
+  // developer/test only: a URL folder holding the snapshot files. Honoured only when the app itself runs on this machine (review: no
+  // production path around the backend).
+  const devSrc = () => (/^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? ls.get('places_src') : null);
+  const hex = (buf) => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  const sha256 = async (bytes) => hex(await crypto.subtle.digest('SHA-256', bytes));
   async function fetchRemote(name) {
     const src = devSrc();
-    if (src) { const r = await fetch(src.replace(/\/?$/, '/') + name, { cache: 'no-cache' }); if (!r.ok) throw new Error('dev source ' + r.status); return new Uint8Array(await r.arrayBuffer()); }
+    if (src) { const r = await fetch(src.replace(/\/?$/, '/') + name + '?r=' + Date.now(), { cache: 'no-store' }); /* never a cached copy: an older service worker cached this test path */ if (!r.ok) throw new Error('dev source ' + r.status); return new Uint8Array(await r.arrayBuffer()); }
     if (!X.S.cfg.url) throw new Error('no_backend');
     const r = await X.api('placesFile', { name }, 60000);
     return b64ToBytes(r.b64);
@@ -45,16 +49,18 @@
     const key = await deviceKey(); if (!key) return false;
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes));
-    await X.idb.put('kv', { t: Date.now(), iv, ct, bytes: bytes.length, v: PV }, 'places:' + name);
+    await X.idb.put('kv', { t: Date.now(), iv, ct, bytes: bytes.length, v: PV, sha: await sha256(bytes) }, 'places:' + name);
     return true;
   }
   async function readLocal(name) {
     const rec = await X.idb.get('kv', 'places:' + name).catch(() => null);
     if (!rec) return null;
+    // review 2a, defect 1: a meta or area file saved by an older app is never trusted while there is signal (they say which files exist)
+    if (rec.v !== PV && navigator.onLine && (name === 'places_meta.json.gz' || name === 'places_areas.json.gz')) return null;
     const key = await deviceKey(); if (!key) return null;
     try {
       const bytes = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: rec.iv }, key, rec.ct));
-      return { bytes, t: rec.t };
+      return { bytes, t: rec.t, sha: rec.sha || await sha256(bytes) };
     } catch (e) {
       // saved under an older device key (the passphrase salt changed): drop it so the file is downloaded again
       console.warn('places: saved file could not be decrypted, removing it', name, e);
@@ -68,16 +74,25 @@
     if (P.mem[name] && !refresh) return P.mem[name];
     if (P.busy.has(name)) return P.busy.get(name);
     const p = (async () => {
-      let from = 'device', bytes = null, t = null;
-      if (!refresh) { const loc = await readLocal(name); if (loc) { bytes = loc.bytes; t = loc.t; } }
+      let from = 'device', bytes = null, t = null, stale = false;
+      if (!refresh) {
+        const loc = await readLocal(name);
+        if (loc) {
+          bytes = loc.bytes; t = loc.t;
+          // a saved copy that differs from the file Drive now holds (meta lists every file's sha256) is replaced while there is signal;
+          // with no signal it is used and marked, so the card can say so
+          const want = P.expect[name];
+          if (want && loc.sha !== want) { if (navigator.onLine || devSrc()) bytes = null; else stale = true; }
+        }
+      }
       if (!bytes) {
         if (!navigator.onLine && !devSrc()) throw new Error('offline');
         bytes = await fetchRemote(name); from = 'network'; t = Date.now();
         await saveLocal(name, bytes).catch(e => console.warn('places save', e));
       }
       const data = await gunzipJson(bytes);
-      const out = { data, from, t, bytes: bytes.length };
-      P.mem[name] = out; P.status[name] = { from, t, bytes: bytes.length, built: data.built };
+      const out = { data, from, t, bytes: bytes.length, stale };
+      P.mem[name] = out; P.status[name] = { from, t, bytes: bytes.length, built: data.built, stale };
       return out;
     })().finally(() => P.busy.delete(name));
     P.busy.set(name, p);
@@ -93,6 +108,14 @@
   }
   async function geoFor(st) { if (P.geo[st]) return P.geo[st]; try { const f = await getFile(`places_geo_${st}.json.gz`); return (P.geo[st] = f.data.g); } catch (e) { return null; } }
   const metaFile = () => getFile('places_meta.json.gz').then(f => f.data);
+  /** the file list Drive holds now: with signal the meta is fetched fresh once a session (4 KB), so every other file can be checked against it */
+  async function freshMeta() {
+    let m = null;
+    if ((navigator.onLine || devSrc()) && !P.metaFresh) { try { m = (await getFile('places_meta.json.gz', { refresh: true })).data; P.metaFresh = true; } catch (e) { m = null; } }
+    if (!m) m = await metaFile();
+    P.expect = {}; for (const f of (m.files || [])) if (f.sha256) P.expect[f.file] = f.sha256;
+    return m;
+  }
   const areasFile = () => getFile('places_areas.json.gz').then(f => f.data.areas);
   const countiesFile = () => getFile('places_counties.json.gz').then(f => f.data.counties);
 
@@ -180,8 +203,15 @@
     const { figs } = C.makeFigures(W, Cm, cm.med ? { e: cm.med, m: cm.med_m } : null, cw.label);
     // ZIP median income is a published median (DP03), shown as is; medians are never combined
     figs.zip_median = { value: W.med, moe90: W.med_m, comparator: { area: cw.label, value: cm.med, moe90: cm.med_m } };
+    // phase 2c: the decade change only where the ZIP area did not change (2010 and 2020 ZCTAs share 99%+ of their land both ways)
+    let zx = null; try { zx = (await getFile('places_zipx.json.gz')).data.zips[z] || {}; } catch (e) { zx = null; }
+    if (zx && zx.d18) {
+      const [a, b, c, d, e2, f, g, h, i, j] = zx.d18;
+      Object.assign(W, { hh18_e: a, hh18_m: b, nv18_e: c, nv18_m: d, pop18_e: e2, pop18_m: f, fb18_e: g, fb18_m: h, sn18_e: i, sn18_m: j });
+      const r2 = C.makeFigures(W, Cm, cm.med ? { e: cm.med, m: cm.med_m } : null, cw.label); for (const k of Object.keys(r2.figs)) if (/_change$/.test(k)) figs[k] = r2.figs[k];
+    }
     const st = rec.st; const mk = st === 'PA' ? (cty === '42101' ? 'PHL' : 'PA') : st === 'NJ' ? 'NJ' : st === 'MA' ? 'MA' : 'national';
-    return { kind: 'zip', id: 'zip:' + z, zip: z, name: `ZIP ${z}`, sub: `${rec.city || ''}${rec.city ? ', ' : ''}${st || ''}`, W, Cm, cty, cw, county: cm, figs, zrec: rec,
+    return { kind: 'zip', id: 'zip:' + z, zip: z, name: `ZIP ${z}`, sub: `${rec.city || ''}${rec.city ? ', ' : ''}${st || ''}`, W, Cm, cty, cw, county: cm, figs, zrec: rec, zx, zxErr: zx === null,
       built: zf.built, from: P.mem['places_zips.json.gz'].from, market: mk, counties, rows: [], missing: [] };
   }
 
@@ -189,6 +219,7 @@
   async function search(q) {
     q = (q || '').trim(); const out = [];
     if (!q) return out;
+    if (looksAddress(q)) out.push({ type: 'Address', label: q, sub: 'Find this address: Philadelphia from the saved property file; elsewhere through the backend (needs signal)', go: () => findAddress(q) });
     if (/^\d{5}$/.test(q)) out.push({ type: 'ZIP', label: `ZIP ${q}`, sub: 'Census ZIP area. A ZIP is not a district.', go: () => openZip(q) });
     if (/^\d{11}$/.test(q)) out.push({ type: 'Tract', label: `Tract ${q}`, sub: 'One census tract', go: () => openTracts({ kind: 'tract', id: 'tract:' + q, tracts: [q] }) });
     const ql = q.toLowerCase();
@@ -282,7 +313,8 @@
     }
     const at = new Date(fix && fix.t || Date.now()).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     const accW = fix && fix.acc ? `, GPS ±${fix.acc.toLocaleString('en-US')} m` : '';
-    await openTracts({ kind: 'radius', id: `here:${lat.toFixed(4)},${lon.toFixed(4)}:${r}`, name: 'Around here', sub: `Fix at ${at}${accW} · ${ts.length} tract${ts.length > 1 ? 's' : ''} with population center within ${r} m`, tracts: ts, radius: r, center: [lat, lon],
+    const lab = fix && fix.label;
+    await openTracts({ kind: 'radius', id: `here:${lat.toFixed(4)},${lon.toFixed(4)}:${r}`, name: lab ? `Around ${lab}` : 'Around here', sub: `${lab ? 'Address located' : 'Fix'} at ${at}${accW} · ${ts.length} tract${ts.length > 1 ? 's' : ''} with population center within ${r} m`, tracts: ts, radius: r, center: [lat, lon],
       wide: fix && fix.acc > r ? fix.acc : null });
   }
 
@@ -304,6 +336,7 @@
     if (!f) return '';
     const internal = opts.internal || (f.flags && f.flags.internal);
     if (internal && P.meeting) return '';
+    if (opts.need && P.meeting === 'district') return '';     // a district meeting hides food-need rows, as a district sheet does
     const v = C.verdict(f, 'share');
     // strength tag: packet traits only, after G5, the one-use rule, the renters cap and below-the-comparator (review defect 5)
     if (internal || opts.need) delete v.tag; else v.tag = C.sheetTag(f.id || '', f, v) || undefined;
@@ -333,7 +366,9 @@
   }
   function changeRow(label, f, pl) {
     if (!f) return '';
-    const v = C.changeVerdict(f); const pct = f.test.pct, cp = f.test.cmp_pct;
+    let v = C.changeVerdict(f); const pct = f.test.pct, cp = f.test.cmp_pct;
+    // a ZIP has no 2014-18 housing-unit count, so the household occupancy test (G2b) cannot run: a rise is never stated as firm
+    if (pl.kind === 'zip' && label === 'Households' && v.word === 'measurable rise') v = { word: 'not firm: the occupancy test cannot run for a ZIP', cls: 'inside', mark: '=' };
     if (P.meeting && f.value < 0 && f.test.measurable) return '';
     // households: the packets print the smaller of the survey change and the change at the 2014-18 occupancy rate (printed_value)
     const shown = f.test.delta_occupancy_held !== undefined && f.test.printed_value !== undefined ? f.test.printed_value : f.value;
@@ -382,13 +417,17 @@
         <p class="small"><b>Compared with</b> ${esc(pl.cw.head)}${kind === 'zip' ? ' (the ZIP\'s county)' : ''}. Survey figures: ACS 2020–24, margins at 90%.</p>
         ${ruleWarn}${pkt}${miss}${wide}${warn.length ? note('<b>Heads up:</b> ' + warn.map(esc).join('; ') + '.') : ''}
         ${cov ? `<div class="pl-cov">${cov}</div>` : ''}
-        ${M ? '' : `<div class="pl-meta small muted">Files built ${esc(pl.built || '')} · ${pl.from === 'device' ? 'read from this device' : 'downloaded now and saved on this device'}</div>`}
+        ${M ? '' : `<div class="pl-meta small muted">Files built ${esc(pl.built || '')}${P.metaCache && P.metaCache.rev ? ' · revision ' + esc(P.metaCache.rev) : ''} · ${pl.from === 'device' ? 'read from this device' : 'downloaded now and saved on this device'}</div>`}
+        <div class="pl-row">${pl.cty ? `<button class="btn ghost" id="plCounty">County card: ${esc(pl.cw.label.replace(/ \(not saved\)$/, ''))}</button>` : ''}${M ? '' : `<button class="btn ghost" id="plPin">${P.pins.some(x => x.id === pinKey(pl)) ? 'Pinned' : 'Pin for side by side'}</button>`}</div>
         <div id="plMap" class="pl-map" aria-label="Map of the tracts"></div>
       </div>
-      ${secPeople(pl)}${secWork(pl)}${secOpen(pl)}${secMoney(pl)}${secFood(pl)}${secHealth(pl)}
+      ${secPeople(pl)}${secWork(pl)}${secOpen(pl)}${P.meeting === 'food' ? '' : secMoney(pl)}${P.meeting === 'district' ? '' : secFood(pl) + secHealth(pl)}
       <p class="muted small pl-foot">${M ? 'Verdicts: <b>solid</b> margin within 30% of the figure; <b>rough</b> margin over 30%; <b>inside the margin</b> no real difference from the comparator; <b>no measurable change</b> or <b>not firm</b> a decade change inside its margin. Survey figures are estimates: say "about".</p>' : `Verdicts: <b>solid</b> margin within 30% of the figure; <b>rough</b> margin over 30% (shown as a range, no sentence); <b>inside the margin</b> the gap to the comparator is smaller than the two margins combined; <b>no measurable change</b> a decade change inside 1.1 times its margin; <b>not firm</b> a household rise that falls inside the margin once the 2014–18 occupancy rate is held. Same rules as the packet builder. Survey figures always take "about".</p>`}`;
     root.querySelectorAll('.pl-chip[title]').forEach(c => c.onclick = () => X.toast(c.textContent.replace(/^[●◐○]/, '').split(' (')[0] + ': ' + c.title));
     root.querySelectorAll('[data-say]').forEach(b => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.say); X.toast('Copied'); } catch (e) { X.toast('Copy not allowed here'); } });
+    P.view = 'place';
+    const cb = $('#plCounty'); if (cb) cb.onclick = () => openCounty(pl.cty);
+    const pb = $('#plPin'); if (pb) pb.onclick = () => togglePin(pl);
     drawMap(pl).catch(e => console.warn('places map', e));
   }
 
@@ -450,7 +489,8 @@
     if (F.pop_change) decade = table('A decade ago (2014–18 moved to 2020 tracts)', changeRow('Residents', F.pop_change, pl) + changeRow('Households', F.hh_change, pl) + changeRow('Born in another country', F.fb_change, pl)
       + changeRow('Households with no car', F.nv_change, pl) + changeRow('Households receiving SNAP', F.sn_change, pl) + changeRow('College and graduate students', F.col_change, pl))
       + (F.pop_change.test.backed_by_2020_count && F.pop_change.test.backed_by_2020_count.p20 ? note(`2020 Census count for these tracts: ${cnt(F.pop_change.test.backed_by_2020_count.p20)}.`) : '');
-    else if (isZip) decade = note('A decade ago: not shown for ZIPs in phase 1 (the ZIP area must be checked for boundary changes first).');
+    else if (isZip) decade = note(pl.zxErr ? 'A decade ago: the ZIP extras file is not on this device; save it in Data status.' : 'A decade ago: not shown. This ZIP\'s area changed between 2010 and 2020 (the 2010 and 2020 ZIP areas share less than 99% of their land, Census relationship file), so the two periods do not cover the same place.');
+    if (isZip && F.pop_change) decade += note('ZIP decade change: the 2014–18 figures are the 2010 ZIP area, which this ZIP keeps (99% or more of its land both ways). No 2014–18 housing-unit count is held for ZIPs, so a household rise is never called firm.');
     const enrollNote = isZip || !W.enr_e ? '' : note('School enrollment shares are of everyone enrolled (age 3+); the last row is college and graduate students among all residents 3 and over. Census table B14007. A single tract is noisy: most of these rows read "rough" there, and that is correct.');
     return sec('people', 'Who lives here', table('Measure', rows) + enrollNote + decade);
   }
@@ -462,7 +502,16 @@
       const yr = pl.rows[0][0].startsWith('42') ? '2024' : '2023';
       body += table('Jobs based here', `<tr><th>Jobs based in these tracts<small>LODES ${yr}; counts, no survey margin</small></th><td class="num">${cnt(F.jobs.value)}</td><td></td><td class="num muted">${cnt(F.jobs.cmp_total)}</td><td>${F.jobs.test.gates.G5 === 'pass' || pl.rows.length === 1 ? vcell({ cls: 'solid', mark: '✓', word: 'count' }) : `<span class="pl-tag">concentrated: one tract holds ${Math.round(F.jobs.top_tract_share * 100)}%</span>`}${F.jobs.test.gates.G5 === 'pass' || pl.rows.length === 1 ? '<div>' + say(`About ${C.round(F.jobs.value, 100)} jobs are based in ${pl.kind === 'radius' ? 'the tracts around here' : 'these tracts'}.`) + '</div>' : ''}</td></tr>`
         + sec.map(x => `<tr><th>${esc(meta.sectors[x.i])}</th><td class="num">${pct1(x.n / F.jobs.value)}</td><td class="num muted">${cnt(x.n)}</td><td class="num muted">${F.jobs.cmp_total ? pct1(x.cmp / F.jobs.cmp_total) : '–'}</td><td class="small muted">${F.jobs.cmp_total && x.n / F.jobs.value >= 1.5 * (x.cmp / F.jobs.cmp_total) ? 'well above ' + esc(pl.cw.label) : ''}</td></tr>`).join(''));
-    } else body += notHeld('Jobs based here', pl.kind === 'zip' ? 'LODES is held by tract; a ZIP lookup does not carry jobs or commuting (jobs by ZIP is a later phase). Look up a tract or district.' : 'not held for these tracts');
+    } else if (pl.kind === 'zip' && pl.zx && pl.zx.jobs) {
+      // phase 2c: jobs by ZIP, Pennsylvania (LODES 2024 blocks summed to the ZIP); no apportioning
+      const j = pl.zx.jobs, tot = j[0]; const cns = j.slice(7); const cm = pl.Cm || {};
+      const top = cns.map((n, i) => ({ i, n, cmp: (cm.cns || [])[i] || 0 })).filter(x => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 4);
+      body += tableH('Jobs based in this ZIP (LODES 2024)', `<tr><th>Jobs based in ZIP ${esc(pl.zip)}<small>LODES 2024 blocks summed to the ZIP area; counts, no survey margin</small></th><td class="num">${cnt(tot)}</td><td></td><td class="num muted">${cnt(cm.jobs)}</td><td>${vcell({ cls: 'plain', mark: '·', word: 'count' })}</td></tr>`
+        + top.map(x => `<tr><th>${esc(meta.sectors[x.i])}</th><td class="num">${pct1(x.n / tot)}</td><td class="num muted">${cnt(x.n)}</td><td class="num muted">${cm.jobs ? pct1(x.cmp / cm.jobs) : '–'}</td><td class="small muted">${cm.jobs && x.n / tot >= 1.5 * (x.cmp / cm.jobs) ? 'well above ' + esc(pl.cw.label) : ''}</td></tr>`).join('')
+        + `<tr><th>Earning $1,250 a month or less · $1,251–3,333 · over $3,333</th><td colspan="4" class="small">${[4, 5, 6].map(k => pct1(j[k] / tot)).join(' · ')}</td></tr>`
+        + `<tr><th>Workers 29 or younger · 30–54 · 55 and over</th><td colspan="4" class="small">${[1, 2, 3].map(k => pct1(j[k] / tot)).join(' · ')}</td></tr>`)
+        + note(`A ZIP is not a district: keep it off the front of a sheet. The comparator column is ${esc(pl.cw.label)}. Where workers live and where residents work stay by tract.`);
+    } else body += notHeld('Jobs based here', pl.kind === 'zip' ? 'jobs by ZIP are held for Pennsylvania only (the LODES block-to-ZIP crosswalk is loaded for Pennsylvania); look up a tract or district' : 'not held for these tracts');
     body += table('How residents get to work', shareRow(F.trait_transit_walk, pl) + shareRow(F.x_drove, pl, { noSay: true }) + shareRow(F.x_wfh, pl, { noSay: true }));
     const prof = phlProfile(pl);
     if (prof && !(pl.wk && pl.wk.septa)) body += table('Transit inside the district (stop-and-route rows; the transit file is not on this device)', `<tr><th>Transit stops inside</th><td class="num">${cnt(prof.transit_stops_inside)}</td><td></td><td></td><td class="small muted">SEPTA, summer 2025</td></tr><tr><th>Weekday bus boardings</th><td class="num">${cnt(prof.bus_weekday_boardings_summer2025)}</td><td></td><td></td><td class="small muted">inside the boundary</td></tr><tr><th>Weekday trolley boardings</th><td class="num">${cnt(prof.trolley_weekday_boardings_summer2025)}</td><td></td><td></td><td></td></tr>`);
@@ -483,8 +532,12 @@
     if (P.rec) return P.rec;
     if (!RC) throw new Error('records code not loaded');
     const f = {}; let from = 'device';
-    for (const n of PTS) { const g = await getFile(n); if (g.from === 'network') from = 'network'; f[n.replace(/^places_pts_|\.json\.gz$/g, '')] = g.data; }
-    P.rec = RC.load(f); P.rec.from = from; return P.rec;
+    let stale = false;
+    for (const n of PTS) { const g = await getFile(n); if (g.from === 'network') from = 'network'; if (g.stale) stale = true; f[n.replace(/^places_pts_|\.json\.gz$/g, '')] = g.data; }
+    P.rec = RC.load(f); P.rec.from = from; P.rec.stale = stale;
+    // review 2a, defect 8: the parsed JSON is no longer needed once decoded into typed columns
+    for (const n of PTS) delete P.mem[n];
+    return P.rec;
   }
   const inPhl = (pl) => pl.kind !== 'zip' && pl.rows && pl.rows.length && pl.rows.every(r => r[0].startsWith('42101'));
   /** the selection a place's records are counted on: corridor addresses, the district boundary, the tracts, or the true circle */
@@ -508,7 +561,7 @@
     if (!ok) { if (a && a.kind === 'corridor' && anyPhl) pl.recErr = 'no_rule'; return; }
     const sel = recordSel(pl); if (!sel) { pl.recErr = 'no_rule'; return; }
     pl.recCity = pl.kind === 'radius' && !inPhl(pl);
-    try { const R = await recordsSet(); pl.rec = RC.summarize(R, sel); pl.rec.from = R.from; pl.rec.dates = R.meta.dates; pl.rec.unplacedShare = unplacedShares(R); }
+    try { const R = await recordsSet(); pl.rec = RC.summarize(R, sel); pl.rec.from = R.from; pl.rec.stale = R.stale; pl.rec.dates = R.meta.dates; pl.rec.unplacedShare = unplacedShares(R); pl.rec.unplacedSba = R._us || (R._us = RC.unplacedSbaShare(R)); }
     catch (e) { console.warn('places records', e); pl.recErr = e.message || String(e); }
   }
   function unplacedShares(R) {
@@ -522,7 +575,8 @@
   function recWhere(pl) {
     const sel = pl.rec && pl.rec.sel; if (!sel) return { short: '', long: '' };
     if (sel.kind === 'addr') {
-      const streets = [...new Set(sel.parts.map(p => titleSt(p[0])))];
+      // a rule with "N 10TH ST" and "S 10TH ST" names one street to a reader ("10th Street"), as the packets print it (review 2a, 11)
+      const streets = [...new Set(sel.parts.map(p => titleSt(p[0].replace(/^[NSEW] (?!(ST|AVE)$)/, ''))))];
       const lim = sel.parts.map(p => `${titleSt(p[0])} ${p[1].toLocaleString('en-US')} to ${p[2].toLocaleString('en-US')}`).join('; ');
       const nm = pl.area && pl.area.kind === 'packet' && !P.meeting ? pl.area.name : streets.length <= 2 ? streets.join(' and ') : 'corridor';
       return { short: `${nm} addresses`, long: `addresses ${lim} (both sides)`, rule: sel.how === 'packet' ? "the packet's address rule" : 'corridor addresses: the full blocks of the street(s) whose parcels front the line' };
@@ -532,7 +586,18 @@
     return { short: sel.tracts.length === 1 ? 'addresses in this tract' : 'addresses in these tracts', long: `inside the ${sel.tracts.length} census tract${sel.tracts.length === 1 ? '' : 's'} of 2020` };
   }
   const yrsCells = (o, ys) => ys.map(y => `${y}: <b>${cnt((o || {})[y] || 0)}</b>`).join(' · ');
-  const gateTag = (g) => (!g || g === 'pass' || P.meeting) ? '' : `<span class="pl-tag">${esc(g.replace(/^FAIL: /, 'not for a sheet: '))}</span>`;
+  /** a run of yearly counts. Meeting mode never shows a run that ends below where it starts (review 2a, defect 5): it shows the total only.
+   *  The last cell of a part year is always labeled with its end date, in every mode. */
+  function runCells(o, ys, opts = {}) {
+    o = o || {}; const v = (y) => o[y] || 0;
+    const tot = ys.reduce((a, y) => a + v(y), 0);
+    if (P.meeting && ys.length > 1 && v(ys[ys.length - 1]) < v(ys[0])) return `${ys[0]}–${String(ys[ys.length - 1]).slice(2)}: <b>${cnt(tot)}</b> in all`;
+    let out = ys.map(y => `${y}: <b>${cnt(v(y))}</b>`).join(' · ');
+    if (opts.partYear && !(P.meeting && opts.partYear.v < v(ys[ys.length - 1]) * opts.partYear.frac)) out += ` · ${esc(opts.partYear.label)}: <b>${cnt(opts.partYear.v)}</b>`;
+    return out;
+  }
+  const monthDay = (d) => d ? new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+  const gateTag = (g) => (!g || g === 'pass' || P.meeting) ? '' : `<span class="pl-tag">${esc(g.replace(/^FAIL: /, 'not for a sheet: ').replace(/^hold the year to date: /, 'year to date under 90% of last year: '))}</span>`;
   const recRow = (label, fig, rest, opts = {}) => (opts.internal && P.meeting) ? '' : `<tr class="${opts.internal ? 'pl-int' : ''}"><th>${esc(label)}${opts.note && !P.meeting ? `<small>${esc(opts.note)}</small>` : ''}</th><td class="num">${fig}</td><td></td><td></td><td>${rest || ''}</td></tr>`;
   const fileDate = (d) => d ? new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : '';
   const Y5 = [2021, 2022, 2023, 2024, 2025];
@@ -540,13 +605,14 @@
   function recPermitsLicenses(pl) {
     const r = pl.rec; const w = recWhere(pl); const p = r.permits, l = r.licenses; const M = P.meeting;
     let rows = '';
-    if (p) {
-      const okSay = p.gates.G3 === 'pass' && p.gates.G5 === 'pass';
+    if (p && P.meeting !== 'food') {
+      // CL-19 (review 2a, defect 2): no copy-ready sentence unless G3, G5 and G7 all pass
+      const okSay = RC.permitSayOK(p);
       const { lead, support } = RC.permitsSay(p, w.short);
-      rows += recRow('Permits issued, 2021–25', cnt(p.five), `${yrsCells(p.by_year, Y5)}${gateTag(p.gates.G3)}${gateTag(p.gates.G5)}${okSay ? '<div>' + say(lead + ' ' + support) + '</div>' : ''}`,
+      rows += recRow('Permits issued, 2021–25', cnt(p.five), `${runCells(p.by_year, Y5)}${gateTag(p.gates.G3)}${gateTag(p.gates.G5)}${gateTag(p.gates.G7)}${okSay ? '<div>' + say(lead + ' ' + support) + '</div>' : ''}`,
         { note: p.steady.steady ? `steady run: about ${cnt(p.steady.avg10)} a year` : 'not a steady run: give the total, not a yearly average' });
       // year to date beside the same point last year (G7); in meeting mode the pair is hidden when this year is behind (no decline on a screen a client sees)
-      if (p.ytd && !(M && p.ytd.this < p.ytd.last)) rows += recRow(`${p.ytd.year} so far (through ${p.ytd.through})`, cnt(p.ytd.this), `same point in ${p.ytd.year - 1}: <b>${cnt(p.ytd.last)}</b>${p.gates.G7 !== 'pass' && !M ? ' <span class="pl-tag">behind last year: the sheet would leave the year to date out</span>' : ''}`);
+      if (p.ytd && !(M && p.ytd.this < p.ytd.last)) rows += recRow(`${p.ytd.year} so far (through ${p.ytd.through})`, cnt(p.ytd.this), `same point in ${p.ytd.year - 1}: <b>${cnt(p.ytd.last)}</b>${p.gates.G7 !== 'pass' && !M ? ' <span class="pl-tag">year to date under 90% of last year: the sheet would leave permits out</span>' : ''}`);
       if (!M) rows += recRow('Top address (2021–25)', cnt(p.top_address_n), `${esc(p.top_address || '–')} · ${Math.round(p.top_share * 100)}% of the five years`, { internal: true });
       if (!M && p.types.length) rows += recRow('By permit type (2021–25)', '', p.types.slice(0, 6).map(([t, n]) => `${esc(t)} <b>${cnt(n)}</b>`).join(' · ') + ` · zoning and administrative ${Math.round(p.zoning_admin_share * 100)}%`);
     }
@@ -554,12 +620,14 @@
       const ckOk = l.gates.CK === 'pass' && l.gates.G5 === 'pass';
       rows += recRow('Active City food licenses', cnt(l.food_active), `at ${cnt(l.food_addresses)} addresses · file of ${fileDate(l.as_of)}${gateTag(l.gates.CK)}${gateTag(l.gates.G5)}${ckOk ? '<div>' + say(`We count ${l.food_active.toLocaleString('en-US')} active City food licenses at ${l.food_addresses.toLocaleString('en-US')} ${w.short}, as of ${fileDate(l.as_of)}.`) + '</div>' : ''}`,
         { note: 'every City license type that starts "Food", as the packets count them' });
-      rows += recRow('Food licenses first issued, 2021–25', cnt(l.first5), `${yrsCells(l.first_issued, Y5)} · ${new Date().getFullYear()} so far: <b>${cnt((l.first_issued || {})[new Date().getFullYear()] || 0)}</b>${gateTag(l.gates.S2)}`,
+      const ly = +String(l.as_of).slice(0, 4);   // the file's year, not the device clock (review 2a, 11)
+      rows += recRow('Food licenses first issued, 2021–25', cnt(l.first5), `${runCells(l.first_issued, Y5, { partYear: { label: `${ly} to ${monthDay(l.as_of)}`, v: (l.first_issued || {})[ly] || 0, frac: 0 } })}${gateTag(l.gates.S2)}`,
         { note: `restaurants and food stores only (the four storefront types): ${Y5.map(y => (l.first_issued_store4 || {})[y] || 0).join(', ')}` });
       rows += recRow('Food licenses that closed, by year', '', yrsCells(l.closed_food, Y5), { internal: true, note: 'inactive, closed, expired or revoked, by the date the City records; internal: a closure count reads as a decline' });
       if (!M) rows += recRow('Active licenses, all types', cnt(l.active_all), l.active_types.slice(0, 5).map(([t, n]) => `${esc(t)} <b>${cnt(n)}</b>`).join(' · '));
     }
     const notes = [];
+    if (r.stale) notes.push('<b>An older copy of the records is on this device</b> (Drive holds a newer one). Connect and use Data status → Re-download everything saved.');
     notes.push(`<b>Where:</b> ${esc(w.long)}${w.rule ? ` (${esc(w.rule)})` : ''}. Records counted exactly; file dates: permits ${fileDate(p && p.as_of)}, licenses ${fileDate(l && l.as_of)}.`);
     notes.push('Say "permits", never "permits for work": zoning and administrative permits are part of the count. Permits and licenses count different things (work approved at an address; a business registered at one); never add them, and an active license can outlast the shop.');
     if (pl.rec.sel.kind !== 'addr') notes.push(`Records with no map location count only on corridor cards, by address: ${Math.round((pl.rec.unplacedShare.lic || 0) * 100)}% of licenses (mostly vendors with no fixed spot) and ${Math.round((pl.rec.unplacedShare.permits || 0) * 100)}% of permits are not on the map.`);
@@ -579,23 +647,31 @@
     }
     const s = r.sales;
     if (s) {
-      const ys = [2021, 2022, 2023, 2024, 2025, 2026];
-      rows += recRow('Recorded sales (deeds over $1,000)', '', yrsCells(s.by_year, ys) + `<div class="small muted">median price ${ys.filter(y => s.median_price[y]).map(y => `${y}: ${usd(s.median_price[y])}`).join(' · ')}</div>`, { note: `recorded through ${fileDate(s.as_of)}; 2026 is a part year; ${cnt(s.nonres_sales)} of them non-residential` });
-      rows += recRow('Sheriff deeds', '', yrsCells(s.sheriff_by_year, ys), { internal: true, note: 'internal: a distress signal, never on a sheet' });
+      // review 2a, defects 4 and 5: one count per deed (a deed covering several properties once); medians from single-property deeds, shown
+      // from 5 deeds; the part year labeled with its end date in every mode; meeting mode never shows a run that ends below its start
+      const sy = +String(s.as_of).slice(0, 4); const part = { label: `${sy} to ${monthDay(s.as_of)}`, v: s.by_year[sy] || 0, frac: 0 };
+      const meds = Y5.filter(y => s.median_price[y]).map(y => `${y}: ${usd(s.median_price[y])}`);
+      rows += recRow('Recorded deeds over $1,000', '', runCells(s.by_year, Y5, { partYear: part }) + (meds.length ? `<div class="small muted">median price, single-property deeds: ${meds.join(' · ')}</div>` : ''),
+        { note: `one count per deed, however many properties it covers; recorded through ${fileDate(s.as_of)}; a median is shown only where a year has 5 or more single-property deeds; ${cnt(s.nonres_sales)} deeds include a non-residential property` });
+      rows += recRow('Sheriff deeds', '', runCells(s.sheriff_by_year, Y5, { partYear: { label: part.label, v: s.sheriff_by_year[sy] || 0, frac: 0 } }), { internal: true, note: 'internal: a distress signal, never on a sheet' });
     }
     const L = r.loans;
     if (L) {
-      const ok = L.gates.G3 === 'pass' && L.gates.G5_count === 'pass';
+      // review 2a, defect 6: only an address rule finds every loan. Counted by map position (district, tract, circle), loans that could not be
+      // placed are missing, so the count is a floor: "at least N", no sentence, no dollar total, and the caveat stays in the cell (meeting mode too)
+      const floor = r.sel.kind !== 'addr'; const us = r.unplacedSba;
+      const ok = !floor && L.gates.G3 === 'pass' && L.gates.G5_count === 'pass';
       const lead = `Lenders approved ${cnt(L.n_since_fy2020)} SBA-backed loans at ${cnt(L.k_addresses)} ${w.short} since October 2019.` + (L.latest ? ` The latest was in ${new Date(L.latest + 'T12:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}.` : '');
-      const fys = Object.keys(L.by_fy).sort();
-      rows += recRow('SBA-backed loans since FY2020', cnt(L.n_since_fy2020), `at ${cnt(L.k_addresses)} addresses${L.latest ? ' · latest ' + fileDate(L.latest) : ''}${fys.length ? '<div class="small">' + fys.map(y => `FY${String(y).slice(2)}: <b>${L.by_fy[y]}</b>`).join(' · ') + '</div>' : ''}`
-        + (L.gates.G5_dollars === 'pass' && L.dollars_since ? `<div class="small muted">${L.dollars_since >= 1e7 ? C.usdBig(L.dollars_since) : usd(L.dollars_since)} approved</div>` : (L.dollars_since && !M ? '<div class="small muted">dollar total withheld: one loan carries over a third of it</div>' : ''))
+      const fys = Object.keys(L.by_fy).sort(); const fyO = {}; for (const y of fys) fyO[y] = L.by_fy[y];
+      const fyRow = fys.length ? (M && fys.length > 1 && (L.by_fy[fys[fys.length - 1]] || 0) < (L.by_fy[fys[0]] || 0) ? '' : '<div class="small">' + fys.map(y => `FY${String(y).slice(2)}: <b>${L.by_fy[y]}</b>`).join(' · ') + '</div>') : '';
+      const dollars = floor ? '' : (L.gates.G5_dollars === 'pass' && L.dollars_since ? `<div class="small muted">${L.dollars_since >= 1e7 ? C.usdBig(L.dollars_since) : usd(L.dollars_since)} approved</div>` : (L.dollars_since && !M ? '<div class="small muted">dollar total withheld: one address holds over a third of it</div>' : ''));
+      const fl = floor ? `<div class="small"><b>A floor:</b> ${us ? `${Math.round(us.share * 100)}% of Philadelphia's FY2020-on loans (${cnt(us.unplaced)} of ${cnt(us.n)})` : 'some loans'} could not be placed on the map and are not counted here; a corridor card counts them by address.</div>` : '';
+      rows += recRow('SBA-backed loans since FY2020', floor ? `at least ${cnt(L.n_since_fy2020)}` : cnt(L.n_since_fy2020), `at ${floor ? 'least ' : ''}${cnt(L.k_addresses)} addresses${L.latest ? ' · latest ' + fileDate(L.latest) : ''}${fyRow}${dollars}${fl}`
         + gateTag(L.gates.G3) + gateTag(L.gates.G5_count) + (ok ? '<div>' + say(lead) + '</div>' : ''), { note: '7(a) and 504; cancelled, not funded and mailbox-store addresses excluded; SBA file Sept 30, 2026. No earlier-decade count: beside a smaller recent count it reads as a decline' });
     }
     const G = r.grants;
     if (G) rows += recRow('Storefront improvement grants', cnt(G.n), G.n ? `${G.fy_first === G.fy_last ? 'fiscal ' + G.fy_first : `fiscal ${G.fy_first}–${G.fy_last}`} · ${usd(G.dollars)}${gateTag(G.gates.G3)}` : 'none recorded');
     const notes = [];
-    if (r.sel.kind !== 'addr') notes.push(`About ${Math.round((r.unplacedShare.sba || 0) * 100)}% of Philadelphia SBA loans could not be placed on the map; they count only on corridor cards, by address.`);
     return `<h4 class="pl-h4">Property and lending at ${esc(w.short)}</h4>` + table(`Property and lending at ${w.short}`, rows) + notes.map(note).join('');
   }
 
@@ -608,7 +684,7 @@
   function secOpen(pl) {
     let body = '';
     const s = storeRows(pl);
-    body += table('SNAP-authorized stores open now', [['All SNAP stores', s.n], ['Supermarkets and super stores', s.sup], ['Grocery stores', s.gro], ['Convenience stores', s.conv], ['Dollar, pharmacy and other', s.oth], ['Specialty stores', s.spec], ['Farmers markets', s.fm]]
+    if (P.meeting !== 'district') body += table('SNAP-authorized stores open now', [['All SNAP stores', s.n], ['Supermarkets and super stores', s.sup], ['Grocery stores', s.gro], ['Convenience stores', s.conv], ['Dollar, pharmacy and other', s.oth], ['Specialty stores', s.spec], ['Farmers markets', s.fm]]
       .map(([l, v]) => `<tr><th>${esc(l)}</th><td class="num">${cnt(v || 0)}</td><td></td><td></td><td class="small muted">USDA file, Nov 13, 2026</td></tr>`).join('')) + snapHistBlock(pl);
     const rec = phlRec(pl); const p = rec && rec.profile;
     if (pl.rec) body += recPermitsLicenses(pl);
@@ -639,7 +715,7 @@
         + `<tr><th>Taxable non-residential value</th><td colspan="4">${vals.map(v => `${v.tax_year}: <b>${C.usdBig(v.taxable_nonres_value)}</b>`).join(' · ')}</td></tr>`
         + (P.meeting ? '' : `<tr class="pl-int"><th>Largest owners<small>internal: never on a sheet or a screen a client sees</small></th><td colspan="4">${(rec.top_owners || []).sort((a, b) => b.n - a.n).map(o => `${esc(o.owner_name)} <b>${o.n}</b>`).join(' · ')}</td></tr>`)
         + `<tr><th>Storefront improvement grants</th><td class="num">${cnt(p.storefront_grants)}</td><td></td><td></td><td class="small muted">${p.storefront_grant_usd ? usd(p.storefront_grant_usd) : ''}</td></tr>`
-        + `<tr><th>SBA-backed loans, FY2020–26</th><td class="num">${cnt(p.sba_loans_fy2020_26)}</td><td></td><td></td><td class="small muted">${p.sba_dollars_fy2020_26 ? (p.sba_dollars_fy2020_26 >= 1e7 ? C.usdBig(p.sba_dollars_fy2020_26) : usd(p.sba_dollars_fy2020_26)) : ''}; cancelled excluded; SBA file Sept 30, 2026</td></tr>`);
+        + `<tr><th>SBA-backed loans, FY2020–26</th><td class="num">at least ${cnt(p.sba_loans_fy2020_26)}</td><td></td><td></td><td class="small"><b>A floor:</b> loans the district table could place inside the boundary; cancelled excluded; SBA file Sept 30, 2026</td></tr>`);
     }
     if (pl.kind === 'zip' && pl.zrec) {
       const W = pl.W; const sba = pl.zrec.sba || []; const fy = {}; for (const [y, prog, n, amt] of sba) { fy[y] = fy[y] || [0, 0]; fy[y][0] += n; fy[y][1] += amt; }
@@ -688,8 +764,17 @@
 
   function placesTable(pl, idx, title) {
     const meta = P.metaCache; const st = pl.kind === 'zip' ? pl.zrec.st : ST_FIPS[pl.rows[0][0].slice(0, 2)];
-    if (st === 'PA') return notHeld(title, 'Pennsylvania is missing from both CDC PLACES releases in the warehouse (2025 tract and 2024 county), so these rows are blank for every Pennsylvania place, Philadelphia included. Use the county Map the Meal Gap figure.');
-    if (pl.kind === 'zip') return notHeld(title, 'held by tract; look up a tract or district (ZIP-level PLACES is a phase 2 check)');
+    if (pl.kind === 'zip') {
+      // phase 2c: CDC PLACES by ZIP where published (2024 release, BRFSS 2022). No 95% range is held for ZIPs.
+      const v = pl.zx && pl.zx.pl; if (!v) return notHeld(title, pl.zxErr ? 'the ZIP extras file is not on this device; save it in Data status' : 'not published for this ZIP');
+      const cp = pl.county && pl.county.places;
+      return table(title.replace(/2025/, '2024 release, by ZIP'), idx.map(i => { const [, lab] = meta.places[i]; const x = v[i];
+        const c = cp && cp[i] !== null && cp[i] !== undefined ? cp[i].toFixed(1) + '%' : '–';
+        return x === null || x === undefined ? `<tr><th>${esc(lab)}</th><td class="num muted">–</td><td></td><td></td><td class="small muted">${i < 3 ? 'not published for this ZIP (none in Pennsylvania or New York)' : 'not published for this ZIP'}</td></tr>`
+          : `<tr><th>${esc(lab)}</th><td class="num">${x.toFixed(1)}%</td><td class="num muted small">no range held</td><td class="num muted">${c}<small> county, 2024</small></td><td><span class="pl-v plain"><b aria-hidden="true">~</b> modeled</span></td></tr>`; }).join(''))
+        + note('CDC PLACES for the ZIP area, 2024 release (2022 survey year). The warehouse holds no 95% range for ZIPs, so read these as rough; the tract figures on district and tract cards carry their ranges.');
+    }
+    if (st === 'PA') return notHeld(title, 'Pennsylvania is missing from both CDC PLACES releases in the warehouse (2025 tract and 2024 county), so these rows are blank for every Pennsylvania tract, Philadelphia included. A ZIP lookup shows the ZIP-level PLACES release where published. Use the county Map the Meal Gap figure.');
     const cp = pl.county && pl.county.places;
     const rows = idx.map(i => {
       const [k, lab] = meta.places[i]; const vals = pl.rows.map(r => [r[pl.ci('pl_' + k)], r[pl.ci('pl_' + k + '_lo')], r[pl.ci('pl_' + k + '_hi')]]).filter(v => v[0] !== null && v[0] !== undefined);
@@ -923,39 +1008,220 @@
     if (bb) m.fitBounds(bb, { padding: [12, 12], maxZoom: 15 });
     L.featureGroup(layers).addTo(m);
     if (marks.length) L.featureGroup(marks).addTo(m);
-    if (layers.length) { /* drawn */ } else if (pl.kind === 'zip') { el.innerHTML = '<p class="muted small" style="padding:10px">ZIP outlines are not drawn in phase 1.</p>'; }
+    if (pl.kind === 'zip' && pl.zrec) {
+      // phase 2c: the ZIP outline (2020 ZCTA, simplified to 40 m)
+      try { const st = pl.zrec.st; const g = P.zgeo[st] || (P.zgeo[st] = (await getFile(`places_zgeo_${st}.json.gz`)).data.g); const rings = g[pl.zip] || [];
+        const zl = rings.map(ring => { const f = ring[0]; const ll = []; for (let i = 0; i < f.length; i += 2) ll.push([f[i + 1], f[i]]); return L.polygon(ll, { color: '#9C5B3A', weight: 2, fillColor: '#C9B391', fillOpacity: 0.3 }); });
+        if (zl.length) { const fg = L.featureGroup(zl).addTo(m); m.fitBounds(fg.getBounds(), { padding: [12, 12], maxZoom: 15 }); }
+        else el.insertAdjacentHTML('beforeend', '<p class="muted small" style="padding:10px">No outline held for this ZIP.</p>');
+      } catch (e) { el.insertAdjacentHTML('beforeend', '<p class="muted small" style="padding:10px;position:relative;z-index:500">ZIP outline not on this device; save it in Data status.</p>'); }
+    }
     setTimeout(() => m.invalidateSize(), 80);
   }
 
   // ---------------------------------------------------------------- data status
-  const FILES_COMMON = ['places_meta.json.gz', 'places_areas.json.gz', 'places_counties.json.gz', 'places_phl.json.gz', 'places_zips.json.gz'].concat(PTS, ['places_food_zips.json.gz', 'places_transit.json.gz']);
-  const stateFiles = (st) => [`places_tracts_${st}.json.gz`, `places_geo_${st}.json.gz`, `places_jobs_${st}.json.gz`, `places_food_${st}.json.gz`];
+  const FILES_COMMON = ['places_meta.json.gz', 'places_areas.json.gz', 'places_counties.json.gz', 'places_phl.json.gz', 'places_zips.json.gz'].concat(PTS, ['places_food_zips.json.gz', 'places_transit.json.gz', 'places_countycard.json.gz', 'places_zipx.json.gz']);
+  const stateFiles = (st) => [`places_tracts_${st}.json.gz`, `places_geo_${st}.json.gz`, `places_jobs_${st}.json.gz`, `places_food_${st}.json.gz`, `places_zgeo_${st}.json.gz`];
+  const HOME_FILES = () => FILES_COMMON.concat(HOME.flatMap(stateFiles));
+  /** saved state of one file against the list Drive holds now: 'current', 'older' (a newer file is in Drive) or 'missing' */
+  async function fileState(f) {
+    const rec = await X.idb.get('kv', 'places:' + f).catch(() => null);
+    if (!rec) return { st: 'missing' };
+    const want = P.expect[f];
+    // an old record has no sha: it is compared after decrypting it
+    let sha = rec.sha; if (!sha && want) { const loc = await readLocal(f).catch(() => null); sha = loc && loc.sha; }
+    return { st: want && sha && sha !== want ? 'older' : (want && !sha ? 'older' : 'current'), t: rec.t, v: rec.v };
+  }
   async function renderStatus() {
     const box = $('#placesStatus'); const meta = await metaFile().catch(() => null);
-    const files = meta ? meta.files.map(f => f.file) : FILES_COMMON.concat(HOME.flatMap(stateFiles));
-    const rows = [];
+    // review 2a, defect 1: the meta itself and every home file are always listed, whatever an older meta says
+    const files = [...new Set(['places_meta.json.gz', ...FILES_COMMON, ...(meta ? meta.files.map(f => f.file) : HOME.flatMap(stateFiles))])];
+    const rows = []; let older = 0;
     for (const f of files) {
-      const rec = await X.idb.get('kv', 'places:' + f).catch(() => null); const info = meta && meta.files.find(x => x.file === f);
-      rows.push(`<tr><th>${esc(f.replace(/^places_|\.json\.gz$/g, ''))}</th><td>${rec ? `saved ${fdate(rec.t)}` : '<span class="pl-tag">not saved</span>'}</td><td class="num muted">${info ? (info.bytes / 1e6).toFixed(1) + ' MB' : ''}</td></tr>`);
+      const fs = await fileState(f); const info = meta && meta.files.find(x => x.file === f);
+      if (fs.st === 'older') older++;
+      const cell = fs.st === 'missing' ? '<span class="pl-tag">not saved</span>' : fs.st === 'older' ? `<span class="pl-tag">older copy, saved ${fdate(fs.t)}: re-download</span>` : `saved ${fdate(fs.t)}`;
+      rows.push(`<tr><th>${esc(f.replace(/^places_|\.json\.gz$/g, ''))}</th><td>${cell}</td><td class="num muted">${info ? (info.bytes / 1e6).toFixed(1) + ' MB' : ''}</td></tr>`);
     }
     const src = devSrc() ? `developer folder (${esc(devSrc())})` : (X.S.cfg.url ? 'B+W backend (Google Drive)' : 'no backend set');
-    box.innerHTML = `<p class="small">Files built ${esc(meta ? meta.built : '?')} · source: ${src} · ${navigator.onLine ? 'online' : '<b>offline</b>'}</p>
+    box.innerHTML = `<p class="small">Files built ${esc(meta ? meta.built : '?')}${meta && meta.rev ? ` · revision ${esc(meta.rev)}` : ''} · source: ${src} · ${navigator.onLine ? 'online' : '<b>offline</b>'}${older ? ` · <b>${older} saved file${older > 1 ? 's are' : ' is'} older than Drive</b>` : ''}</p>
       <div class="pl-row"><button class="btn" id="plHome">Save home pack (PA, NJ, DE, Philadelphia records)</button></div>
       <div class="pl-row">${['MA', 'RI', 'CT', 'NY', 'MD'].map(s => `<button class="btn ghost" data-trip="${s}">Save ${s}</button>`).join('')}</div>
       <div class="pl-row"><button class="btn ghost" id="plRefresh">Re-download everything saved</button></div>
       <div class="pl-tw"><table class="pl-t pl-files"><tbody>${rows.join('')}</tbody></table></div>
       <p class="muted small">iPhones and iPads can clear saved files when storage runs low. Check this list before leaving Wi-Fi.</p>`;
-    $('#plHome').onclick = () => savePack(FILES_COMMON.concat(HOME.flatMap(stateFiles)));
+    $('#plHome').onclick = () => savePack(HOME_FILES());
     box.querySelectorAll('[data-trip]').forEach(b => b.onclick = () => savePack(stateFiles(b.dataset.trip)));
-    $('#plRefresh').onclick = async () => { const saved = []; for (const f of files) if (await haveLocal(f)) saved.push(f); await savePack(saved, true); };
+    // every saved file, the meta first (so the list is current), then the rest
+    $('#plRefresh').onclick = async () => { const saved = ['places_meta.json.gz']; for (const f of files) if (f !== 'places_meta.json.gz' && await haveLocal(f)) saved.push(f); await savePack(saved, true); };
   }
   async function savePack(files, refresh = false) {
     let ok = 0, bad = [];
     for (const f of files) { X.toast(`Saving ${f.replace(/^places_|\.json\.gz$/g, '')}…`); try { await getFile(f, { refresh }); ok++; } catch (e) { bad.push(f + ': ' + whyFail(e)); } }
     X.toast(bad.length ? `Saved ${ok}; ${bad.length} failed` : `Saved ${ok} file${ok === 1 ? '' : 's'}`);
     if (bad.length) console.warn(bad);
-    P.tracts = {}; P.geo = {}; P.cmpCache = {}; P.rec = null;
+    // forget everything parsed from the old copies, the meta and the areas included (review 2a, defect 1)
+    for (const n of Object.keys(P.mem)) delete P.mem[n];
+    P.tracts = {}; P.geo = {}; P.zgeo = {}; P.cmpCache = {}; P.rec = null; P.metaFresh = false;
+    try { P.metaCache = await freshMeta(); } catch (e) { }
     renderStatus();
+  }
+
+  // ---------------------------------------------------------------- phase 2c: county card (design 3.1 item 6, 3.8; section 4 keep lists)
+  const countyCardFile = () => getFile('places_countycard.json.gz').then(f => f.data);
+  const MONTHS_S = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const pctV = (x, d = 1) => x === null || x === undefined ? '–' : Number(x).toFixed(d) + '%';
+  const signed = (x) => x === null || x === undefined ? '–' : (x > 0 ? '+' : '') + Number(x).toFixed(1) + '%';
+  async function openCounty(cty) {
+    const root = $('#placesCard'); P.view = 'county'; P.countyId = cty;
+    root.innerHTML = '<div class="card"><p class="muted">Loading the county card…</p></div>';
+    let K, counties;
+    try { K = await countyCardFile(); counties = await countiesFile(); } catch (e) { root.innerHTML = `<div class="card"><b>County card not on this device.</b><p class="muted small">${esc(whyFail(e))}</p></div>`; return; }
+    const c = K.counties[cty]; const nm = (counties[cty] || {}).name || cty; const M = P.meeting;
+    const back = P.place ? `<button class="btn ghost" id="plBack">Back to ${esc(P.place.name || 'the place')}</button>` : '';
+    if (!c) {
+      root.innerHTML = `<div class="card pl-head"><div class="eyebrow">County</div><h2>${esc(nm)}</h2><p class="muted small">${cty.startsWith('09') ? 'Connecticut: the 2024 survey uses the 2022 planning regions, while the county sources (QCEW, LAUS, CRA, the Food Environment Atlas, the farm census) are held by the old counties. Not matched in this build.' : 'Not held for this county.'}</p>${back}</div>`;
+      if (back) $('#plBack').onclick = () => { P.view = 'place'; render(P.place); };
+      return;
+    }
+    const secs = (c.sectors || []).filter(x => x.est || x.emp).sort((a, b) => (b.emp || 0) - (a.emp || 0));
+    const shown = secs.filter(x => x.emp !== null).reduce((a, x) => a + x.emp, 0); const withheld = secs.filter(x => x.emp === null).length;
+    let econ = tableH(`Private employment and pay by sector (BLS QCEW, ${c.qcew_year} annual average)`, secs.map(x => `<tr><th>${esc(x.nm)}<small>NAICS ${esc(x.n)} · ${cnt(x.est)} establishments</small></th><td class="num">${x.emp === null ? '<span class="muted">withheld</span>' : cnt(x.emp)}</td><td class="num muted">${x.pay ? usd(x.pay) : ''}</td><td></td><td class="small muted">${x.emp === null ? 'BLS withholds this sector to protect single employers' : `jobs · average annual pay${x.emp_yoy === null || x.emp_yoy === undefined ? '' : ` · jobs against a year earlier: ${signed(x.emp_yoy)}`}`}</td></tr>`).join(''))
+      + note(`Each row: jobs, average annual pay, and jobs against the year before (counts from records, no margin). The sectors shown add to ${cnt(shown)} private jobs${withheld ? `; ${withheld} sector${withheld > 1 ? 's are' : ' is'} withheld, so the total is higher` : ''}. Changes are listed, never described as rising or falling.`);
+    const lm = c.laus_month, la = c.laus_year || [];
+    econ += tableH('Unemployment (BLS LAUS, county, not seasonally adjusted)', (lm && lm.ur !== null ? `<tr><th>Latest month<small>${MONTHS_S[(lm.m || 1) - 1]} ${lm.y}</small></th><td class="num">${pctV(lm.ur)}</td><td></td><td></td><td class="small muted">one month; seasonal swings are not removed</td></tr>` : '')
+      + la.map(a => `<tr><th>${a.y} average</th><td class="num">${pctV(a.ur)}</td><td></td><td></td><td class="small muted">labor force ${cnt(a.lf)}</td></tr>`).join(''));
+    const cr = c.cra;
+    if (cr && cr.n) econ += tableH(`Bank small-business lending (CRA, ${cr.y})`, `<tr><th>Small-business loans originated</th><td class="num">${cnt(cr.n)}</td><td></td><td></td><td class="small muted">${cr.usd >= 1e7 ? C.usdBig(cr.usd) : usd(cr.usd)} · average ${usd(cr.avg)}</td></tr>`
+      + `<tr><th>Under $100,000</th><td class="num">${cnt(cr.n100)}</td><td></td><td></td><td class="small muted">${pctV(cr.n100 / cr.n * 100)} of loans</td></tr>`
+      + `<tr><th>To firms with revenue of $1 million or less</th><td class="num">${pctV(cr.psr * 100)}</td><td></td><td></td><td class="small muted">${cnt(cr.nsr)} loans</td></tr>`
+      + `<tr><th>In low- or moderate-income tracts</th><td class="num">${pctV(cr.plmi * 100)}</td><td></td><td></td><td class="small muted">${cnt(cr.nlow)} low, ${cnt(cr.nmod)} moderate</td></tr>`)
+      + note('CRA reports cover banks that must report (larger banks); loans by credit unions, small banks and online lenders are not in it. County level only.');
+    const o = c.own;
+    if (o && o.firms) {
+      const row = (lab, a, b) => `<tr><th>${esc(lab)}</th><td class="num">${pctV(a)}</td><td></td><td></td><td class="small muted">of employer firms · nonemployer firms: ${pctV(b)}</td></tr>`;
+      econ += tableH(`Business ownership (${o.y}): employer firms ${cnt(o.firms)}, nonemployer firms ${cnt(o.ne_firms)}`, row('Women-owned', o.fem, o.ne_fem) + row('Minority-owned', o.min, o.ne_min) + row('Black-owned', o.blk, o.ne_blk) + row('Hispanic-owned', o.hsp, o.ne_hsp) + row('Asian-owned', o.asn, o.ne_asn) + `<tr><th>Veteran-owned</th><td class="num">${pctV(o.vet)}</td><td></td><td></td><td class="small muted">of employer firms</td></tr>`)
+        + note('Shares of firms whose owners are classified (Census Annual Business Survey for employer firms; Nonemployer Statistics by Demographics for firms with no employees). County level only. The dashboard\'s "scaling gap" ratios are not carried: the warehouse view does not say how they are formed.');
+    }
+    const mmg = (counties[cty] || {}).mmg && counties[cty].mmg['2024'];
+    let food = mmg ? tableH('Food insecurity (Feeding America, Map the Meal Gap 2024)', `<tr><th>All ages</th><td class="num">${pct1(mmg[0])}</td><td></td><td></td><td class="small muted">about ${cnt(mmg[1])} people · modeled, no margin</td></tr><tr><th>Children</th><td class="num">${pct1(mmg[2])}</td><td></td><td></td><td></td></tr><tr><th>Cost per meal</th><td class="num">${mmg[3] ? '$' + mmg[3].toFixed(2) : '–'}</td><td></td><td></td><td></td></tr>`) : '';
+    const fe = c.fe;
+    if (fe && fe.src) {
+      const r = (lab, n, k) => `<tr><th>${esc(lab)}</th><td class="num">${cnt(n)}</td><td></td><td></td><td class="small muted">${k !== null && k !== undefined ? Number(k).toFixed(2) + ' per 1,000 residents' : ''}</td></tr>`;
+      food += tableH('Food environment (USDA ERS Food Environment Atlas, 2025 release)', r('Grocery stores', fe.gro, fe.gro_k) + r('Supercenters and club stores', fe.sup) + r('Convenience stores', fe.conv, fe.conv_k) + r('Specialty food stores', fe.spec) + r('Dollar stores', fe.dol, fe.dol_k)
+        + r('SNAP-authorized stores', fe.snap, fe.snap_k) + r('WIC-authorized stores', fe.wic) + r('Fast-food restaurants', fe.ff, fe.ff_k) + r('Full-service restaurants', fe.fs, fe.fs_k) + r('Food banks', fe.fb)
+        + `<tr><th>SNAP benefits per person, a month</th><td class="num">${fe.snap_pc ? '$' + Number(fe.snap_pc).toFixed(2) : '–'}</td><td></td><td></td><td></td></tr>`)
+        + note('The Atlas carries each measure with its own reference year, most of them earlier than the release; the SNAP store count here is the Atlas\'s, not the Nov 13, 2026 USDA file the place cards use.');
+    }
+    const ag = c.ag;
+    if (ag && ag.farms !== null && ag.farms !== undefined) food += tableH(`Farms (USDA Census of Agriculture ${ag.y})`, `<tr><th>Farms</th><td class="num">${cnt(ag.farms)}</td><td></td><td></td><td class="small muted">${cnt(ag.acres)} acres in farms · ${ag.sales >= 1e7 ? C.usdBig(ag.sales) : usd(ag.sales)} in sales</td></tr><tr><th>Farms selling directly to people</th><td class="num">${cnt(ag.fdirect)}</td><td></td><td></td><td class="small muted">${pctV(ag.pdirect)} of farms · ${usd(ag.direct)} direct sales (${pctV(ag.sdirect)} of sales)</td></tr>`);
+    root.innerHTML = `<div class="card pl-head"><div class="eyebrow">County card</div><h2>${esc(nm)}</h2><p class="small">The county's economy and its food environment. Counts from records and models, not survey figures: no margins, and nothing here is a sheet figure.</p>${back}</div>`
+      + sec('cty-econ', 'The county economy', econ) + (M === 'district' ? '' : sec('cty-food', 'County food environment', food || notHeld('County food', 'not held for this county')));
+    if (back) $('#plBack').onclick = () => { P.view = 'place'; render(P.place); };
+  }
+
+  // ---------------------------------------------------------------- phase 2c: address search (backend; Philadelphia also from the saved parcels)
+  const looksAddress = (q) => /^\s*\d+[A-Za-z]?(?:\s*-\s*\d+)?\s+[A-Za-z0-9]/.test(q) && /[A-Za-z]{2,}/.test(q) && !/^\d{5}$/.test(q.trim());
+  /** a light copy of the builder's normalizer for typed addresses (numbered streets, direction words, street types) */
+  function addrParts(q) {
+    let a = q.toUpperCase().split(',')[0].replace(/[.#]/g, ' ').replace(/\s+/g, ' ').trim();
+    a = a.replace(/\bSTREET\b/g, 'ST').replace(/\bAVENUE\b|\bAV\b/g, 'AVE').replace(/\bROAD\b/g, 'RD').replace(/\bBOULEVARD\b/g, 'BLVD').replace(/\bLANE\b/g, 'LN').replace(/\bDRIVE\b/g, 'DR').replace(/\bPLACE\b/g, 'PL');
+    a = a.replace(/\b(PHILADELPHIA|PHILA|PA)\b.*$/, '').trim();
+    const m = a.match(/^(\d+)[A-Z]?(?:\s*-\s*\d+[A-Z]?)?\s+(.*)$/); if (!m) return null;
+    let st = m[2].replace(/^(NORTH|SOUTH|EAST|WEST) (?!(ST|AVE)$)/, (x, d) => d[0] + ' ').replace(/\b0*(\d+)\s?(ST|ND|RD|TH)\b(?= |$)/g, (x, n) => n + ({ 1: 'ST', 2: 'ND', 3: 'RD' }[n % 100 >= 11 && n % 100 <= 13 ? 0 : n % 10] || 'TH'));
+    st = st.replace(/\s(?:\d+(?:ST|ND|RD|TH)\s)?(?:STE|SUITE|FL|FLOOR|UNIT|APT|REAR)\b.*$/, '').trim();
+    if (/^SOUTH ST$/.test(st)) st = 'S ST';
+    return { hn: +m[1], st };
+  }
+  async function localPhl(q) {
+    const a = addrParts(q); if (!a) return null;
+    const files = await Promise.all(PTS.map(haveLocal)); if (files.some(x => !x) && !navigator.onLine && !devSrc()) return null;
+    let R; try { R = await recordsSet(); } catch (e) { return null; }
+    const ids = RC.streetIds(R, a.st); if (!ids.size) return null;
+    const Ly = R.L.parcels, c = Ly.c; const bs = new Map();
+    for (let i = 0; i < Ly.n; i++) { if (!ids.has(c.st[i]) || c.y[i] === null) continue; const h = c.hn[i]; if (!h) continue; (bs.get(c.st[i]) || bs.set(c.st[i], []).get(c.st[i])).push(i); }
+    const hits = [];
+    for (const [sid, list] of bs) {
+      let best = null;
+      for (const i of list) { const d = Math.abs(c.hn[i] - a.hn); if (c.hn[i] % 2 === a.hn % 2 && d <= 30 && (!best || d < best.d)) best = { d, i }; }
+      if (best) hits.push({ lat: 39.8 + c.y[best.i] / 1e5, lon: -75.3 + c.x[best.i] / 1e5, matched: `${a.hn} ${titleSt(R.streets[sid])}, Philadelphia`, exact: best.d === 0, near: best.d });
+    }
+    return hits.length ? hits.sort((x, y) => x.near - y.near) : null;
+  }
+  async function findAddress(q) {
+    const box = $('#placesHere'); box.innerHTML = '<p class="muted small">Looking up the address…</p>';
+    let hits = null, source = '';
+    const phlish = !/,\s*(?!PHILADELPHIA|PHILA)[A-Z]/i.test(q) || /PHILA|\b191\d\d\b/i.test(q);
+    if (phlish) { hits = await localPhl(q).catch(() => null); if (hits) source = 'the City property file saved on this device (OPA parcels)'; }
+    if (!hits) {
+      if (!navigator.onLine) { box.innerHTML = '<p class="muted small">No signal: an address outside the saved Philadelphia property file needs the backend. Use Here or a district instead.</p>'; return; }
+      try {
+        const r = await X.api('placesGeocode', { q }, 30000);
+        if (r && r.hits && r.hits.length) { hits = r.hits; source = r.source; }
+      } catch (e) { box.innerHTML = `<p class="muted small">Address lookup failed: ${esc(e.message === 'unknown_action' ? 'the backend has not been updated for address search yet (placesGeocode)' : whyFail(e))}.</p>`; return; }
+    }
+    if (!hits) { box.innerHTML = '<p class="muted small">Address not found. Check the number and street, or add the town and state.</p>'; return; }
+    const pick = (h) => { P.addrPin = { lat: h.lat, lon: h.lon, label: h.matched, source };
+      box.innerHTML = `<div class="eyebrow">Around ${esc(h.matched)}</div><p class="muted small">Located from ${esc(source)}${h.exact === false ? ` (nearest number on the same side, ${h.near} away)` : ''}.</p><div class="pl-row">${[400, 805, 1600].map(r => `<button class="btn${r === P.radius ? ' primary' : ''}" data-arad="${r}">${{ 400: '400 m · ¼ mi', 805: '805 m · ½ mi', 1600: '1,600 m · 1 mi' }[r]}</button>`).join('')}</div>`;
+      box.querySelectorAll('[data-arad]').forEach(b => b.onclick = () => { P.radius = +b.dataset.arad; radius(h.lat, h.lon, P.radius, { t: Date.now(), acc: 0, label: h.matched }); });
+      radius(h.lat, h.lon, P.radius, { t: Date.now(), acc: 0, label: h.matched }); };
+    if (hits.length === 1) return pick(hits[0]);
+    box.innerHTML = `<div class="eyebrow">Which one?</div><div class="list tight">${hits.slice(0, 5).map((h, i) => `<div class="item" data-h="${i}"><span class="txt"><b>${esc(h.matched)}</b></span></div>`).join('')}</div>`;
+    box.querySelectorAll('[data-h]').forEach(el => el.onclick = () => pick(hits[+el.dataset.h]));
+  }
+
+  // ---------------------------------------------------------------- phase 2c: side by side (internal; hidden in meeting mode)
+  const pinKey = (pl) => pl.id || (pl.zip ? 'zip:' + pl.zip : (pl.tracts || []).join(','));
+  function loadPins() { try { return JSON.parse(ls.get('places_pins') || '[]').slice(0, 2); } catch (e) { return []; } }
+  function pinDesc(pl) { return { id: pinKey(pl), kind: pl.kind, name: pl.name || (pl.zip ? 'ZIP ' + pl.zip : 'Selected tracts'), zip: pl.zip, tracts: pl.kind === 'zip' ? null : pl.rows.map(r => r[0]), area: pl.area ? { id: pl.area.id } : null,
+    radius: pl.radius, center: pl.center }; }
+  function pinsUi() { const b = $('#plCmpBtn'); if (b) { b.hidden = !!P.meeting || P.pins.length < 2; b.textContent = `Side by side (${P.pins.length})`; } }
+  function togglePin(pl) {
+    const k = pinKey(pl); const i = P.pins.findIndex(x => x.id === k);
+    if (i >= 0) P.pins.splice(i, 1); else { P.pins.push(pinDesc(pl)); if (P.pins.length > 2) P.pins.shift(); }
+    ls.set('places_pins', JSON.stringify(P.pins)); pinsUi(); X.toast(i >= 0 ? 'Unpinned' : `Pinned (${P.pins.length} of 2)`);
+    const b = $('#plPin'); if (b) b.textContent = i >= 0 ? 'Pin for side by side' : 'Pinned';
+  }
+  async function buildPinned(d) {
+    let pl;
+    if (d.kind === 'zip') pl = await fromZip(d.zip);
+    else { let area = null; if (d.area) area = (await areasFile()).find(x => x.id === d.area.id) || null;
+      pl = await fromTracts({ kind: d.kind, id: d.id, name: d.name, tracts: area ? area.tracts : d.tracts, area, radius: d.radius, center: d.center }); }
+    await attachRecords(pl); return pl;
+  }
+  async function showCompare() {
+    if (P.meeting || P.pins.length < 2) return;
+    const root = $('#placesCard'); P.view = 'compare'; root.innerHTML = '<div class="card"><p class="muted">Building the side-by-side view…</p></div>';
+    let A, B; try { [A, B] = [await buildPinned(P.pins[0]), await buildPinned(P.pins[1])]; } catch (e) { root.innerHTML = `<div class="card"><b>Couldn't build the view.</b><p class="muted small">${esc(whyFail(e))}</p></div>`; return; }
+    const ta = new Set((A.rows || []).map(r => r[0])); const shared = (B.rows || []).filter(r => ta.has(r[0])).length;
+    const indep = !shared && A.kind !== 'zip' && B.kind !== 'zip';
+    const test = (fa, fb) => {
+      if (!fa || !fb || fa.value === null || fb.value === null || fa.value === undefined || fb.value === undefined) return '';
+      if (!indep) return '<span class="muted small">no test: the two areas overlap or one is a ZIP</span>';
+      const d = Math.abs(fa.value - fb.value), m = C.rss(fa.moe90 || 0, fb.moe90 || 0);
+      return d > m ? '<span class="pl-v solid"><b aria-hidden="true">≠</b> differ beyond the two margins</span>' : '<span class="pl-v inside"><b aria-hidden="true">=</b> inside the margins: don\'t quote a difference</span>';
+    };
+    const sh = (f) => !f || f.value === null || f.value === undefined ? '–' : `${pct1(f.value)} <span class="muted small">${pts1(f.moe90)}</span>`;
+    const ct = (f, money) => !f || f.value === null || f.value === undefined ? '–' : `${money ? C.usdBig(f.value) : cnt(f.value)} <span class="muted small">${f.moe90 !== null && f.moe90 !== undefined ? (money ? '±' + C.usdBig(f.moe90).replace(/^\$/, '$') : cntm(f.moe90)) : ''}</span>`;
+    const rows = [['Residents', ct(A.figs.res_wa), ct(B.figs.res_wa), test(A.figs.res_wa, B.figs.res_wa)], ['Households', ct(A.figs.hh_wa), ct(B.figs.hh_wa), test(A.figs.hh_wa, B.figs.hh_wa)],
+      ['Total household income', ct(A.figs.agg_income, true), ct(B.figs.agg_income, true), test(A.figs.agg_income, B.figs.agg_income)]];
+    for (const [k, lab] of [['trait_born_abroad', 'Born in another country'], ['trait_lang_other', 'Language other than English'], ['trait_u18', 'Under 18'], ['trait_a1824', '18 to 24'], ['trait_a65', '65 and over'],
+      ['trait_renters', 'Renter households'], ['trait_no_car', 'Households with no car'], ['trait_transit_walk', 'Transit or walk to work'], ['x_snap', 'Households receiving SNAP'], ['x_ba', "Bachelor's degree or more"]])
+      rows.push([lab, sh(A.figs[k]), sh(B.figs[k]), test(A.figs[k], B.figs[k])]);
+    const jobs = (pl) => pl.figs.jobs && pl.figs.jobs.value !== null ? cnt(pl.figs.jobs.value) : '–';
+    rows.push(['Jobs based here (LODES)', jobs(A), jobs(B), '<span class="muted small">counts</span>']);
+    const rec = (pl, f) => pl.rec ? f(pl.rec) : '<span class="muted small">not held</span>';
+    const floorOf = (pl) => pl.rec && pl.rec.sel.kind !== 'addr' ? 'at least ' : '';
+    rows.push(['City permits, 2021–25', rec(A, r => r.permits ? cnt(r.permits.five) : '–'), rec(B, r => r.permits ? cnt(r.permits.five) : '–'), '<span class="muted small">counts at each area\'s own rule</span>']);
+    rows.push(['Active City food licenses', rec(A, r => r.licenses ? cnt(r.licenses.food_active) : '–'), rec(B, r => r.licenses ? cnt(r.licenses.food_active) : '–'), '']);
+    rows.push(['SBA-backed loans since FY2020', rec(A, r => r.loans ? floorOf(A) + cnt(r.loans.n_since_fy2020) : '–'), rec(B, r => r.loans ? floorOf(B) + cnt(r.loans.n_since_fy2020) : '–'), '']);
+    rows.push(['SNAP stores open now', cnt(storeRows(A).n || 0), cnt(storeRows(B).n || 0), '']);
+    const head = (pl) => `${esc(pl.name || (pl.zip ? 'ZIP ' + pl.zip : 'Selected tracts'))}<small>${pl.kind === 'zip' ? 'ZIP' : `${pl.rows.length} tract${pl.rows.length === 1 ? '' : 's'}`} · against ${esc(pl.cw.label)}</small>`;
+    root.innerHTML = `<div class="card pl-head"><div class="eyebrow">Side by side · internal</div><h2>${esc(A.name || 'A')} and ${esc(B.name || 'B')}</h2>
+      <p class="small">Two pinned places. A difference is called only where the two areas share no tract and the gap is larger than the two margins combined (the packets' inside-the-margin rule, applied between two places). Records are counted at each area's own rule (address, boundary, tracts or circle), so they are listed, never tested. Hidden in meeting mode.${shared ? ` <b>These areas share ${shared} tract${shared > 1 ? 's' : ''}:</b> no test is made.` : ''}</p>
+      <div class="pl-row"><button class="btn ghost" id="plUnpinAll">Clear pins</button></div></div>`
+      + `<section class="card pl-sec"><h4 class="pl-h4">Side by side</h4><div class="pl-tw"><table class="pl-t pl-cmp"><thead><tr><th>Measure</th><th>${head(A)}</th><th>${head(B)}</th><th>Test</th></tr></thead><tbody>${rows.map(r => `<tr><th>${esc(r[0])}</th><td class="num"><span class="pl-cl">${esc(A.name || 'A')}: </span>${r[1]}</td><td class="num"><span class="pl-cl">${esc(B.name || 'B')}: </span>${r[2]}</td><td>${r[3]}</td></tr>`).join('')}</tbody></table></div></section>`;
+    $('#plUnpinAll').onclick = () => { P.pins = []; ls.set('places_pins', '[]'); pinsUi(); P.view = 'place'; if (P.place) render(P.place); else root.innerHTML = ''; };
   }
 
   // ---------------------------------------------------------------- shell
@@ -966,21 +1232,24 @@
           <button id="plHereBtn" class="btn">Here</button></div>
         <div id="plResults" class="list tight"></div>
         <div id="placesHere"></div>
-        <div class="row between pl-tools"><label class="small"><input type="checkbox" id="plMeeting"> Meeting mode <span class="muted">(figures, margins and verdicts only)</span></label>
-          <button id="plStatusBtn" class="link small">Data status</button></div>
+        <div class="row between pl-tools"><label class="small">Meeting mode <select id="plMeeting" aria-label="Meeting mode">
+            <option value="">off</option><option value="district">district meeting</option><option value="food">food-access meeting</option></select>
+            <span class="muted">(figures, margins and verdicts only)</span></label>
+          <span><button id="plCmpBtn" class="link small" hidden>Side by side</button> <button id="plStatusBtn" class="link small">Data status</button></span></div>
         <div id="placesStatus" hidden></div>
       </div>
       <div id="placesCard"><div class="card"><p class="muted">Type a district or corridor (Mayfair, Frankford), a ZIP (19149), a Philadelphia neighborhood or tract number, or tap <b>Here</b>.</p></div></div>`;
     let tm; $('#plQ').oninput = (e) => { clearTimeout(tm); tm = setTimeout(() => runSearch(e.target.value), 180); };
     $('#plQ').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(e.target.value, true); } };
     $('#plHereBtn').onclick = here;
-    $('#plMeeting').checked = P.meeting; $('#plMeeting').onchange = (e) => {
-      P.meeting = e.target.checked; ls.set('places_meeting', P.meeting ? '1' : '');
+    $('#plMeeting').value = P.meeting; $('#plMeeting').onchange = (e) => {
+      P.meeting = e.target.value; ls.set('places_meeting', P.meeting);
       $('#plResults').innerHTML = '';                                  // results may carry organization names
-      $('#placesStatus').hidden = true; $('#plStatusBtn').hidden = P.meeting;
-      if (P.place) render(P.place);
+      $('#placesStatus').hidden = true; $('#plStatusBtn').hidden = !!P.meeting; pinsUi();
+      if (P.view === 'county' && P.countyId) openCounty(P.countyId); else if (P.view === 'compare') { if (P.meeting) { P.view = 'place'; if (P.place) render(P.place); } else showCompare(); } else if (P.place) render(P.place);
     };
-    $('#plStatusBtn').hidden = P.meeting;
+    $('#plStatusBtn').hidden = !!P.meeting; pinsUi();
+    $('#plCmpBtn').onclick = () => showCompare();
     $('#plStatusBtn').onclick = () => { const b = $('#placesStatus'); b.hidden = !b.hidden; if (!b.hidden) renderStatus(); };
   }
   async function runSearch(q, first) {
@@ -995,11 +1264,11 @@
   // yet updated, a timeout) never leaves the tab dead until the app restarts (review defect 2).
   async function open(ctx) {
     X = ctx; const root = document.getElementById('placesRoot');
-    if (!P.started) { P.started = true; P.meeting = ls.get('places_meeting') === '1'; shell(root); }
+    if (!P.started) { P.started = true; const m = ls.get('places_meeting'); P.meeting = m === '1' ? 'district' : (m === 'district' || m === 'food') ? m : ''; P.pins = loadPins(); shell(root); }
     if (P.ready || P.opening) return;
     P.opening = true;
     try {
-      try { P.metaCache = await metaFile(); }
+      try { P.metaCache = await freshMeta(); }
       catch (e) {
         $('#placesCard').innerHTML = `<div class="card"><b>Places files are not on this device yet.</b><p class="muted small">${esc(whyFail(e))}</p><div class="pl-row"><button class="btn" id="plRetry">Try again</button></div></div>`;
         $('#plRetry').onclick = () => open(X);
@@ -1012,9 +1281,10 @@
       if (last) { try { const l = JSON.parse(last); if (l.kind === 'radius') { /* never restored */ } else if (l.kind === 'zip') openZip(l.zip); else if (l.area) { const a = (await areasFile()).find(x => x.id === l.area.id); if (a) openArea(a); } else if (l.tracts) openTracts(l); } catch (e) { } }
       // the home pack saves itself when the tab opens with signal and any home file is missing (an interrupted save resumes)
       if (navigator.onLine) {
-        const home = FILES_COMMON.concat(HOME.flatMap(stateFiles)); const need = [];
-        for (const f of home) if (!(await haveLocal(f))) need.push(f);
-        if (need.length) savePack(need).catch(() => { });
+        // missing home files, and saved ones older than the copy in Drive (the meta lists each file's sha256), are fetched again
+        const need = [];
+        for (const f of HOME_FILES()) { const fs = await fileState(f); if (fs.st !== 'current') need.push(f); }
+        if (need.length) savePack(need, true).catch(() => { });
       }
     } finally { P.opening = false; }
   }

@@ -279,7 +279,75 @@ if (fs.existsSync(path.join(snapDir, 'places_transit.json.gz'))) {
     for (const m of G.mismatches.slice(0, 10)) console.log('        ', m.who, m.key, 'places=', JSON.stringify(m.places), 'packet=', JSON.stringify(m.packet)); }
   console.log(`phase 2b: ${report.p2b.compared} checks, ${report.p2b.matched} match, ${report.p2b.explained} explained, ${report.p2b.mismatched} unexplained mismatch; SNAP history reconciles in ${report.p2b.snap_reconcile.tracts - report.p2b.snap_reconcile.not_reconciling} of ${report.p2b.snap_reconcile.tracts} tracts, the other ${report.p2b.snap_reconcile.not_reconciling} exactly the documented list; daytime identity exact in ${report.p2b.daytime_exact_areas} named areas`);
 } else console.log('phase 2b: transit/jobs/food snapshots not in this folder; 2b checks skipped');
+// ---------------------------------------------------------------- final pass (Nov 15): the phase 2a review fixes, and phase 2c (counted apart)
+// References outside the repo (they hold no figures in the repo): places_gate_ref/ next to the explained file.
+report.final = { compared: 0, matched: 0, mismatched: 0, checks: [] };
+{
+  const refDir = explainedPath ? path.join(path.dirname(explainedPath), 'places_gate_ref') : null;
+  const ref = (n) => refDir && fs.existsSync(path.join(refDir, n)) ? JSON.parse(fs.readFileSync(path.join(refDir, n))) : null;
+  const fchk = (who, key, a, b) => { report.final.compared++; const ok = JSON.stringify(a) === JSON.stringify(b); report.final.checks.push({ who, key, places: a, expected: b, ok });
+    if (ok) report.final.matched++; else { report.final.mismatched++; console.log('FAIL final', who, key, 'places=', JSON.stringify(a), 'expected=', JSON.stringify(b)); } };
+  if (fs.existsSync(path.join(snapDir, 'places_pts_meta.json.gz'))) {
+    const R = Rec.load({ meta: gz('places_pts_meta.json.gz'), lic: gz('places_pts_lic.json.gz'), permits: gz('places_pts_permits.json.gz'), parcels: gz('places_pts_parcels.json.gz'),
+      sales: gz('places_pts_sales.json.gz'), small: gz('places_pts_small.json.gz') });
+    const areas = gz('places_areas.json.gz').areas;
+    // 1. the rule-part matcher is the builder's (CL-36): every part of every area matches the same streets as the Python reference
+    const pm = ref('places_gate_partmatch_expected.json');
+    if (pm) for (const [part, ids] of Object.entries(pm.parts)) fchk('matcher', part, [...Rec.streetIds(R, part)].sort((a, b) => a - b), ids);
+    // 2. parcels and owner names at every Philadelphia packet's address rule, against OPA `location` counted with records.in_rule (defect 3)
+    const pe = ref('places_gate_parcels_expected.json');
+    if (pe) for (const [k, e] of Object.entries(pe.packets)) {
+      const a = areas.find(x => x.pkt_folder === k); if (!a || !a.addr) { fchk(k, 'packet area present', false, true); continue; }
+      const S = Rec.summarize(R, { kind: 'addr', parts: a.addr.parts });
+      fchk(k, 'property.n', S.property.n, e.parcels); fchk(k, 'property.owners_normalized', S.property.owners, e.owners_normalized);
+    }
+    const fe = ref('places_gate_final_expected.json') || {};
+    // 3. CL-19 (defect 2): a permit sentence only when G3, G5 and G7 pass, for every packet; the listed packets offer none
+    for (const a of areas.filter(x => x.kind === 'packet' && x.addr)) {
+      const S = Rec.summarize(R, { kind: 'addr', parts: a.addr.parts }); const p = S.permits; if (!p || !p.ytd) continue;
+      fchk(a.pkt_folder, 'permit sentence offered only when G3, G5 and G7 pass', Rec.permitSayOK(p), p.gates.G3 === 'pass' && p.gates.G5 === 'pass' && p.ytd.this >= 0.9 * p.ytd.last);
+      if ((fe.no_permit_sentence_packets || []).includes(a.pkt_folder)) fchk(a.pkt_folder, 'no permit sentence (year to date under 90%)', Rec.permitSayOK(p), false);
+      const say = Rec.permitsSay(p, 'x addresses'); fchk(a.pkt_folder, 'no year-to-date sentence when this year is behind', p.ytd.this < p.ytd.last ? !/against/.test(say.support) : true, true);
+    }
+    // 4. deeds per deed, median on single-property deeds (defect 4)
+    for (const d of fe.deeds || []) {
+      const sel = d.sel || { kind: 'addr', parts: (areas.find(x => x.pkt_folder === d.packet) || { addr: { parts: [] } }).addr.parts };
+      const sl = Rec.summarize(R, sel).sales; fchk(d.who || d.packet, `deeds ${d.year} (documents)`, sl.by_year[d.year], d.documents);
+      if (d.median_single) fchk(d.who || d.packet, `median ${d.year}, single-property deeds`, sl.median_price[d.year], d.median_single);
+    }
+    // 5. SBA floors (defect 6): the unplaced share among the loans the cards show (FY2020 on, mailbox stores out)
+    const u = Rec.unplacedSbaShare(R); if (fe.sba_unplaced_fy2020_on) fchk('sba', 'unplaced FY2020-on loans', [u.unplaced, u.n], fe.sba_unplaced_fy2020_on);
+    fchk('sba', 'no FY2010-19 loans shipped (defect 9)', [...R.L.sba.c.fy].filter(y => y < 2020).length, 0);
+    // dollars tested by address (defect 10)
+    const pk = areas.filter(x => x.kind === 'packet' && x.addr).map(a => [a.pkt_folder, Rec.summarize(R, { kind: 'addr', parts: a.addr.parts }).loans]);
+    for (const [k, L] of pk) if (L && L.dollars_since) fchk(k, 'SBA dollar test is by address', L.gates.G5_dollars === 'pass', !(L.top_address_dollar_share > 1 / 3));
+    // 6. lines trimmed to the published limits (defect 7)
+    const tr = (id) => (areas.find(x => x.id === id) || {}).tracts || [];
+    for (const [id, n] of Object.entries(fe.tracts || {})) fchk(id, 'tracts after the trim', tr(id).length, n);
+    for (const [id, t] of Object.entries(fe.tract_out || {})) fchk(id, t + ' out', tr(id).includes(t), false);
+    // East Falls: one part per street, no overlap (review 11)
+    for (const a of areas.filter(x => x.addr)) { const by = {}; for (const [st, lo, hi] of a.addr.parts) (by[st] ||= []).push([lo, hi]);
+      const overl = Object.values(by).some(rs => rs.sort((x, y) => x[0] - y[0]).some((r, i) => i && r[0] <= rs[i - 1][1])); if (overl) fchk(a.id, 'no overlapping parts', overl, false); }
+    fchk('areas', 'no overlapping address parts anywhere', areas.filter(x => x.addr).every(a => { const by = {}; for (const [st, lo, hi] of a.addr.parts) (by[st] ||= []).push([lo, hi]); return Object.values(by).every(rs => rs.sort((x, y) => x[0] - y[0]).every((r, i) => !i || r[0] > rs[i - 1][1])); }), true);
+  }
+  // 7. versioned files (defect 1): every listed file carries the sha256 of the file in this folder; the meta carries a rev
+  const crypto = require('crypto'); const meta = gz('places_meta.json.gz');
+  fchk('meta', 'rev present', typeof meta.rev === 'string' && meta.rev.length === 12, true);
+  for (const f of meta.files) fchk('meta', 'sha256 ' + f.file, f.sha256, crypto.createHash('sha256').update(fs.readFileSync(path.join(snapDir, f.file))).digest('hex'));
+  // 8. phase 2c: ZIP jobs (PA) sum to the PA tract jobs exactly; stable-ZIP decade cells present; county card covers every comparator county held
+  if (fs.existsSync(path.join(snapDir, 'places_zipx.json.gz'))) {
+    const ZX = gz('places_zipx.json.gz'); const PA = gz('places_tracts_PA.json.gz'); const jc = PA.cols.indexOf('jobs') + 1;
+    fchk('zipx', 'PA jobs by ZIP = PA jobs by tract', Object.values(ZX.zips).reduce((a, z) => a + (z.jobs ? z.jobs[0] : 0), 0), PA.rows.reduce((a, r) => a + (r[jc] || 0), 0));
+    fchk('zipx', 'stable ZIPs carried', Object.values(ZX.zips).filter(z => z.d18).length, ZX.stable_n);
+    for (const z of Object.values(ZX.zips)) if (z.jobs) { const s = z.jobs.slice(7).reduce((a, b) => a + b, 0); if (s !== z.jobs[0]) { fchk('zipx', 'ZIP sectors sum to the total', s, z.jobs[0]); break; } }
+    const CC = gz('places_countycard.json.gz').counties; const counties = gz('places_counties.json.gz').counties;
+    const missing = Object.keys(counties).filter(c => !c.startsWith('09') && !CC[c]);
+    fchk('countycard', 'every non-Connecticut comparator county has a county card', missing, []);
+    for (const [c, k] of Object.entries(CC)) { const bad = (k.sectors || []).filter(s => s.emp === 0); if (bad.length) { fchk('countycard', c + ' withheld sectors shown as withheld, never 0', bad.length, 0); break; } }
+  }
+  console.log(`final pass: ${report.final.compared} checks, ${report.final.matched} match, ${report.final.mismatched} unexplained mismatch`);
+}
 console.log(`\n${report.totals.compared} checks, ${report.totals.matched} match, ${report.totals.explained || 0} explained variance, ${report.totals.mismatched} unexplained mismatch (${report.totals.printed_mismatch} on a printed value)`);
 console.log(`verdict consistency: ${report.verdicts.compared} checks, ${report.verdicts.ok} ok, ${report.verdicts.failed} failed`);
 if (reportPath) fs.writeFileSync(reportPath, JSON.stringify(report, null, 1));
-process.exit(report.totals.mismatched || report.verdicts.failed || report.records.mismatched || (report.p2b && report.p2b.mismatched) ? 1 : 0);
+process.exit(report.totals.mismatched || report.verdicts.failed || report.records.mismatched || (report.p2b && report.p2b.mismatched) || (report.final && report.final.mismatched) ? 1 : 0);
