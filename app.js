@@ -4,7 +4,7 @@
    Storefronts come from the backend in 0.02° tiles (OSM via BigQuery) and are cached on the device.
    Captures and plans live in BigQuery via the Apps Script backend; captures wait in IndexedDB until sent. */
 'use strict';
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.8.0';
 const TZ = 'America/New_York';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -1064,12 +1064,12 @@ function switchView(v) {
   if (v === 'more') { renderSyncChip(); renderPush().catch(() => { }); }
   ls.set('view', v);
 }
-// Places lives in places-core.js, places-records.js (phase 2) and places.js, loaded the first time the tab opens, so a Places problem cannot break the other tabs.
+// Places lives in places-core.js, places-records.js (phase 2), places-work.js (phase 2b) and places.js, loaded the first time the tab opens, so a Places problem cannot break the other tabs.
 let placesLoading = null;
 function loadScript(src) { return new Promise((res, rej) => { const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => rej(new Error('load ' + src)); document.head.appendChild(el); }); }
 async function openPlaces() {
   try {
-    if (!window.BWPlaces) { placesLoading = placesLoading || loadScript('places-core.js?v=3').then(() => loadScript('places-records.js?v=3')).then(() => loadScript('places.js?v=3')); await placesLoading; }
+    if (!window.BWPlaces) { placesLoading = placesLoading || loadScript('places-core.js?v=4').then(() => loadScript('places-records.js?v=4')).then(() => loadScript('places-work.js?v=4')).then(() => loadScript('places.js?v=4')); await placesLoading; }
     await window.BWPlaces.open({ S, api, idb, esc, toast });
   } catch (e) { console.warn('places', e); placesLoading = null; $('#placesRoot').innerHTML = '<div class="card"><b>Places could not load.</b><p class="muted small">' + esc(e.message) + '. The other tabs are unaffected.</p></div>'; }
 }

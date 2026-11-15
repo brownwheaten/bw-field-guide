@@ -176,7 +176,110 @@ if (fs.existsSync(path.join(snapDir, 'places_pts_meta.json.gz'))) {
   }
   console.log(`records: ${report.records.compared} checks, ${report.records.matched} match, ${report.records.explained} explained, ${report.records.mismatched} unexplained mismatch`);
 } else console.log('records: point snapshots not in this folder; records checks skipped');
+// ---------------------------------------------------------------- phase 2b: jobs and commuting, transit, food extras (counted apart)
+// One source of truth: the new files must agree with the phase 1 tract file where they overlap, and reproduce every figure the packets carry
+// for jobs (M3), transit (M1, CL-20, CL-28) and the 17 district tables. Everything else is an integrity identity.
+const Work = require('../places-work.js');
+report.p2b = { compared: 0, matched: 0, explained: 0, mismatched: 0, groups: {} };
+if (fs.existsSync(path.join(snapDir, 'places_transit.json.gz'))) {
+  const grp = (g) => (report.p2b.groups[g] ||= { compared: 0, matched: 0, explained: 0, mismatched: 0, mismatches: [], explained_list: [] });
+  const pchk = (g, who, key, a, b) => {
+    const G = grp(g); report.p2b.compared++; G.compared++;
+    if (JSON.stringify(a) === JSON.stringify(b)) { report.p2b.matched++; G.matched++; return true; }
+    const e = EXPL.find(x => x.p2b && x.packets.includes(who) && key in x.keys && typeof a === 'number' && typeof b === 'number' && Math.abs(a - b) <= x.keys[key]);
+    if (e) { report.p2b.explained++; G.explained++; G.explained_list.push({ who, key, places: a, packet: b, reason: e.reason }); return true; }
+    report.p2b.mismatched++; G.mismatched++; G.mismatches.push({ who, key, places: a, packet: b }); return false;
+  };
+  const JF = {}, FF = {};
+  for (const st of ['PA', 'NJ', 'NY', 'DE', 'MD', 'MA', 'CT', 'RI']) {
+    if (fs.existsSync(path.join(snapDir, `places_jobs_${st}.json.gz`))) JF[st] = gz(`places_jobs_${st}.json.gz`);
+    if (fs.existsSync(path.join(snapDir, `places_food_${st}.json.gz`))) FF[st] = gz(`places_food_${st}.json.gz`);
+  }
+  const JX = Work.jobsIndex(JF);
+  // A. jobs file = phase 1 tract file (jobs and the 20 sectors), every tract; B. O-D integrity
+  let aBad = 0, aN = 0, bBad = 0, bN = 0, paBelow = 0;
+  for (const [t, { st, r }] of Object.entries(tracts)) {
+    const C = cols[st]; const j = r[1 + C.indexOf('jobs')]; const x = JX.get(t); const w = x && x.v[0];
+    if (j === null || j === undefined) { if (w && w[0]) aBad++; continue; }
+    aN++; const cns = C.filter(c => /^cns\d\d$/.test(c)).map(c => r[1 + C.indexOf(c)] || 0);
+    if (!w || w[0] !== j || JSON.stringify(w.slice(7)) !== JSON.stringify(cns)) aBad++;
+  }
+  for (const [t, x] of JX) {
+    const [w, rr, hs, wb] = x.v; if (w && wb) { bN++; if (wb.reduce((a, b) => a + b, 0) !== w[0]) bBad++; }
+    if (x.st === 'PA' && rr && hs !== null && rr[0] < hs) paBelow++;
+  }
+  pchk('jobs_tract_file', 'all', 'tracts whose jobs file disagrees with the phase 1 tract file (jobs, 20 sectors)', aBad, 0);
+  pchk('od_integrity', 'all', 'work tracts whose origin bands do not sum to the jobs line', bBad, 0);
+  pchk('od_integrity', 'all', 'Pennsylvania home tracts with 2024 RAC below the in-state O-D', paBelow, 0);
+  report.p2b.tract_counts = { jobs_compared: aN, od_compared: bN };
+  // C. the packets' jobs block; D. the packets' transit block (Philadelphia)
+  const T = gz('places_transit.json.gz'); const areas2 = gz('places_areas.json.gz').areas;
+  const SEC = { retail: 6, edu: 14, health: 15, food: 17, prof: 11, pubadm: 19, fin: 9 };
+  for (const dir of fs.readdirSync(pktDir).sort()) {
+    const ip = path.join(pktDir, dir, 'inputs.json'); if (dir.startsWith('_') || !fs.existsSync(ip)) continue;
+    const I = JSON.parse(fs.readFileSync(ip)); const F = JSON.parse(fs.readFileSync(path.join(pktDir, dir, 'figures.json'))); const RI = I.records || {};
+    const J = Work.jobsArea(JX, F.meta.tracts, {}, {});
+    if (RI.jobs && J) {
+      pchk('packet_jobs', dir, 'jobs.total', J.jobs, RI.jobs.total); pchk('packet_jobs', dir, 'jobs.top_tract', Math.round(J.topTractShare * J.jobs), RI.jobs.top_tract);
+      pchk('packet_jobs', dir, 'jobs.top_tract_id', J.topTract, RI.jobs.top_tract_id); pchk('packet_jobs', dir, 'jobs.year', J.year, RI.jobs.year);
+      for (const [k, i] of Object.entries(SEC)) if (RI.jobs.sectors && k in RI.jobs.sectors) pchk('packet_jobs', dir, 'jobs.sector.' + k, J.wac[7 + i], RI.jobs.sectors[k]);
+      if (RI.jobs.cmp_total !== undefined) { const cw = Work.countyWac(JX, F.meta.tracts[0].slice(0, 5)); pchk('packet_jobs', dir, 'jobs.cmp_total', cw[0], RI.jobs.cmp_total);
+        for (const [k, i] of Object.entries(SEC)) if (RI.jobs.cmp_sectors && k in RI.jobs.cmp_sectors) pchk('packet_jobs', dir, 'jobs.cmp_sector.' + k, cw[7 + i], RI.jobs.cmp_sectors[k]); }
+    }
+    const a = areas2.find(x => x.id === 'pkt:' + F.meta.district_key);
+    const tr = RI.transit;
+    if (tr && a && a.pkt_line) {
+      const s = Work.septaSelect(T, { kind: 'line', geom: a.pkt_line }); const st = Work.stationsSelect(T, { kind: 'line', geom: a.pkt_line }, 400);
+      pchk('packet_transit', dir, 'transit.n', s.ons, tr.n); pchk('packet_transit', dir, 'transit.stops', s.stops, tr.stops);
+      pchk('packet_transit', dir, 'transit.bus', s.bus, tr.bus); pchk('packet_transit', dir, 'transit.trolley', s.trolley, tr.trolley);
+      if (tr.second_path) { pchk('packet_transit', dir, 'transit.at40', s.at40, tr.second_path.buffer_40m); pchk('packet_transit', dir, 'transit.at80', s.at80, tr.second_path.buffer_80m); }
+      const mine = st.in.filter(x => x.kind === 'rail_undated').map(x => `${x.nm}:${x.ons}`).sort(); const theirs = (tr.rail || []).filter(x => x.dist_m <= 60).map(x => `${x.name}:${x.n}`).sort();
+      pchk('packet_transit', dir, 'transit.rail_within_60m', mine, theirs);
+      const fb = F.figures.boardings; if (fb && fb.test && fb.test.gates) {
+        pchk('packet_transit', dir, 'transit.G3', s.gates.G3.slice(0, 4), String(fb.test.gates.G3).slice(0, 4)); pchk('packet_transit', dir, 'transit.G5', s.gates.G5.slice(0, 4), String(fb.test.gates.G5).slice(0, 4));
+        if (fb.test.gates.buffer_10pct) pchk('packet_transit', dir, 'transit.buffer', s.gates.buffer.slice(0, 4), String(fb.test.gates.buffer_10pct).slice(0, 4));
+      }
+      const rb = F.figures.rail_boardings; if (rb) pchk('packet_transit', dir, 'transit.rail_total', st.in.filter(x => x.kind === 'rail_undated').reduce((q, x) => q + x.ons, 0), rb.value);
+    }
+  }
+  // E. the 17 City districts: boardings inside the boundary and stop-and-route rows against the phase 1 district tables
+  const phl2 = gz('places_phl.json.gz').districts; const SS = T.septa.stops;
+  for (const [id, d] of Object.entries(phl2)) {
+    const p = d.profile; if (!p || !p.district_id) continue; const s = Work.septaSelect(T, { kind: 'district', id });
+    let rowsN = 0; for (let i = 0; i < SS.sc.length; i++) if (SS.ds[i] === +id) rowsN += SS.nrow[i];
+    pchk('district_transit', 'district:' + id, 'bus', s.bus, p.bus_weekday_boardings_summer2025); pchk('district_transit', 'district:' + id, 'trolley', s.trolley, p.trolley_weekday_boardings_summer2025);
+    pchk('district_transit', 'district:' + id, 'stop_route_rows', rowsN, p.transit_stops_inside);
+  }
+  // F. SNAP history: the survey cells agree with the tract file; the store history reconciles to the Nov 13 file tract by tract
+  let gBad = 0, recon = 0; const offT = [];
+  for (const [st, f] of Object.entries(FF)) {
+    const C = cols[st]; if (!C) continue;
+    for (const [t, c] of Object.entries(f.gap)) { const x = tracts[t]; if (!x) continue; if (x.r[1 + C.indexOf('sn0_e')] !== c[0] || x.r[1 + C.indexOf('sn_e')] !== c[2]) gBad++; }
+    for (const t of Object.keys(f.snap_hist)) { recon++; if (!Work.snapHistory(f.snap_hist, [t]).reconciles) offT.push(t); }
+  }
+  pchk('food', 'all', 'tracts whose B22003 cells disagree with the tract file (households, receiving SNAP)', gBad, 0);
+  // store history = end of 2004 + openings - closings = the Nov 13 file, tract by tract. The tracts that do not reconcile must be exactly the
+  // documented list (a store whose Nov 13 location is in another tract, or whose type moved to or from farmers market); none other, none missing
+  const expT = new Set((EXPL.find(x => x.p2b && x.snap_reconcile_expected) || {}).snap_reconcile_expected || []);
+  const unexplainedT = offT.filter(t => !expT.has(t)), missingT = [...expT].filter(t => !offT.includes(t));
+  pchk('food', 'all', 'snap_hist.tracts_not_reconciling_and_not_documented', unexplainedT.length, 0);
+  pchk('food', 'all', 'snap_hist.documented_tracts_that_now_reconcile', missingT.length, 0);
+  if (expT.size && !unexplainedT.length && !missingT.length) { grp('food').explained_list.push({ who: 'all', key: 'snap_hist reconciliation', places: offT.length, reason: (EXPL.find(x => x.snap_reconcile_expected) || {}).reason }); }
+  report.p2b.snap_reconcile = { tracts: recon, not_reconciling: offT.length, documented: expT.size };
+  if (FF.PA) { pchk('food', 'PA', 'SNAP stores that take WIC, by tract = the statewide count', Object.values(FF.PA.wic).reduce((q, v) => q + v.length, 0), FF.PA.wic_stats.snap_stores_taking_wic);
+    pchk('food', 'PA', 'WIC list = matched + unmatched', FF.PA.wic_stats.matched_wic_stores + FF.PA.wic_stats.unmatched_wic_stores, FF.PA.wic_stats.state_list);
+    pchk('food', 'PA', 'CEP sites placed + unplaced = the PDE list', FF.PA.cep.length + FF.PA.cep_unplaced.participating + FF.PA.cep_unplaced.not_participating, FF.PA.cep_total); }
+  // G. daytime identity: residents + jobs - employed residents equals residents + in-commuters - out-commuters wherever the flows are exact
+  let dN = 0, dBad = 0;
+  for (const a of areas2) { const J = Work.jobsArea(JX, a.tracts, Object.fromEntries(a.tracts.filter(t => tracts[t]).map(t => { const C = cols[tracts[t].st]; return [t, [tracts[t].r[1 + C.indexOf('lat')], tracts[t].r[1 + C.indexOf('lon')]]]; })), {});
+    if (!J || J.internal === null) continue; const d = Work.daytime(1000, 0, J); dN++; if (d.residents + d.inCommuters - d.outCommuters !== d.value) dBad++; }
+  pchk('daytime', 'all', 'areas where in/out commuters do not reproduce the daytime estimate', dBad, 0);
+  report.p2b.daytime_exact_areas = dN;
+  for (const [g, G] of Object.entries(report.p2b.groups)) { console.log(`${G.mismatched ? 'FAIL' : 'ok  '} 2b ${g.padEnd(20)} ${G.compared} checks, ${G.mismatched} mismatches, ${G.explained} explained`);
+    for (const m of G.mismatches.slice(0, 10)) console.log('        ', m.who, m.key, 'places=', JSON.stringify(m.places), 'packet=', JSON.stringify(m.packet)); }
+  console.log(`phase 2b: ${report.p2b.compared} checks, ${report.p2b.matched} match, ${report.p2b.explained} explained, ${report.p2b.mismatched} unexplained mismatch; SNAP history reconciles in ${report.p2b.snap_reconcile.tracts - report.p2b.snap_reconcile.not_reconciling} of ${report.p2b.snap_reconcile.tracts} tracts, the other ${report.p2b.snap_reconcile.not_reconciling} exactly the documented list; daytime identity exact in ${report.p2b.daytime_exact_areas} named areas`);
+} else console.log('phase 2b: transit/jobs/food snapshots not in this folder; 2b checks skipped');
 console.log(`\n${report.totals.compared} checks, ${report.totals.matched} match, ${report.totals.explained || 0} explained variance, ${report.totals.mismatched} unexplained mismatch (${report.totals.printed_mismatch} on a printed value)`);
 console.log(`verdict consistency: ${report.verdicts.compared} checks, ${report.verdicts.ok} ok, ${report.verdicts.failed} failed`);
 if (reportPath) fs.writeFileSync(reportPath, JSON.stringify(report, null, 1));
-process.exit(report.totals.mismatched || report.verdicts.failed || report.records.mismatched ? 1 : 0);
+process.exit(report.totals.mismatched || report.verdicts.failed || report.records.mismatched || (report.p2b && report.p2b.mismatched) ? 1 : 0);

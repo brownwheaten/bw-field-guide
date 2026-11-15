@@ -26,3 +26,14 @@ what's opening and closing, property and money, food access and a small health s
 - `test/places_gate.mjs` now also rebuilds the packets' records figures and the district tables' counts from the point snapshots.
 - Districts with a published corridor carry a corridor line and its tract list; area districts stay on the boundary rule, marked desk only.
 - The point snapshots, like the rest, are built outside this repository and kept in the owner's Google Drive.
+
+## Places phase 2b (branch `places-v3`, app 1.8.0; stacked on phase 2a)
+
+- `places-work.js`: jobs and commuting from LEHD LODES (jobs here by sector, earnings and age; where workers live and where residents work, by
+  distance band and county; a daytime estimate labeled as a B+W estimate with its method), transit boardings by stop (SEPTA stops counted by
+  distinct stop code at 60 m of a corridor line with the 40 m and 80 m second paths, inside a district, in tracts or in a true circle; stations
+  listed beside the stops and never added to them; MBTA and PATH the same way), SNAP store openings and closings by year (years listed, no
+  direction words), the below-poverty-not-receiving-SNAP survey share, and Pennsylvania WIC stores and community-eligibility schools.
+- `test/places_gate.mjs` also checks the new files against the phase 1 tract file and the packets' jobs and transit figures and the district
+  tables; phase 1 and 2a checks are unchanged.
+- The new snapshot files, like the rest, are built outside this repository and kept in the owner's Google Drive.

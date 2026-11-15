@@ -7,7 +7,8 @@
   'use strict';
   const C = window.BWPlacesCore;
   const RC = window.BWPlacesRecords;   // places-records.js (phase 2): Philadelphia address records
-  const PV = '1.2.0';
+  const WK = window.BWPlacesWork;      // places-work.js (phase 2b): jobs and commuting, transit, food extras
+  const PV = '1.3.0';
   let X = null;                       // context from app.js: { S, api, idb, esc, toast }
   const P = { mem: {}, tracts: {}, geo: {}, cmpCache: {}, meeting: false, place: null, map: null, status: {}, busy: new Map(), radius: 805 };
   const ST_FIPS = { '09': 'CT', '10': 'DE', '24': 'MD', '25': 'MA', '34': 'NJ', '36': 'NY', '42': 'PA', '44': 'RI' };
@@ -225,6 +226,7 @@
     try {
       const pl = await build(); P.place = pl;
       await attachRecords(pl);
+      await attachWork(pl);
       if (pl.kind !== 'radius') ls.set('places_last', JSON.stringify({ id: pl.id, kind: pl.kind, tracts: pl.tracts, zip: pl.zip, name: pl.name, sub: pl.sub, area: pl.area ? { id: pl.area.id } : null }));
       await render(pl);
     } catch (e) {
@@ -460,11 +462,11 @@
       const yr = pl.rows[0][0].startsWith('42') ? '2024' : '2023';
       body += table('Jobs based here', `<tr><th>Jobs based in these tracts<small>LODES ${yr}; counts, no survey margin</small></th><td class="num">${cnt(F.jobs.value)}</td><td></td><td class="num muted">${cnt(F.jobs.cmp_total)}</td><td>${F.jobs.test.gates.G5 === 'pass' || pl.rows.length === 1 ? vcell({ cls: 'solid', mark: '✓', word: 'count' }) : `<span class="pl-tag">concentrated: one tract holds ${Math.round(F.jobs.top_tract_share * 100)}%</span>`}${F.jobs.test.gates.G5 === 'pass' || pl.rows.length === 1 ? '<div>' + say(`About ${C.round(F.jobs.value, 100)} jobs are based in ${pl.kind === 'radius' ? 'the tracts around here' : 'these tracts'}.`) + '</div>' : ''}</td></tr>`
         + sec.map(x => `<tr><th>${esc(meta.sectors[x.i])}</th><td class="num">${pct1(x.n / F.jobs.value)}</td><td class="num muted">${cnt(x.n)}</td><td class="num muted">${F.jobs.cmp_total ? pct1(x.cmp / F.jobs.cmp_total) : '–'}</td><td class="small muted">${F.jobs.cmp_total && x.n / F.jobs.value >= 1.5 * (x.cmp / F.jobs.cmp_total) ? 'well above ' + esc(pl.cw.label) : ''}</td></tr>`).join(''));
-    } else body += notHeld('Jobs based here', pl.kind === 'zip' ? 'LODES is held by tract; a ZIP lookup does not carry it in phase 1. Look up a tract or district.' : 'not held for these tracts');
+    } else body += notHeld('Jobs based here', pl.kind === 'zip' ? 'LODES is held by tract; a ZIP lookup does not carry jobs or commuting (jobs by ZIP is a later phase). Look up a tract or district.' : 'not held for these tracts');
     body += table('How residents get to work', shareRow(F.trait_transit_walk, pl) + shareRow(F.x_drove, pl, { noSay: true }) + shareRow(F.x_wfh, pl, { noSay: true }));
     const prof = phlProfile(pl);
-    if (prof) body += table('Transit inside the district', `<tr><th>Transit stops inside</th><td class="num">${cnt(prof.transit_stops_inside)}</td><td></td><td></td><td class="small muted">SEPTA, summer 2025</td></tr><tr><th>Weekday bus boardings</th><td class="num">${cnt(prof.bus_weekday_boardings_summer2025)}</td><td></td><td></td><td class="small muted">inside the boundary</td></tr><tr><th>Weekday trolley boardings</th><td class="num">${cnt(prof.trolley_weekday_boardings_summer2025)}</td><td></td><td></td><td></td></tr>`);
-    body += note('Phase 2: where workers here live and where residents work, boardings by stop for any area, and the daytime estimate.');
+    if (prof && !(pl.wk && pl.wk.septa)) body += table('Transit inside the district (stop-and-route rows; the transit file is not on this device)', `<tr><th>Transit stops inside</th><td class="num">${cnt(prof.transit_stops_inside)}</td><td></td><td></td><td class="small muted">SEPTA, summer 2025</td></tr><tr><th>Weekday bus boardings</th><td class="num">${cnt(prof.bus_weekday_boardings_summer2025)}</td><td></td><td></td><td class="small muted">inside the boundary</td></tr><tr><th>Weekday trolley boardings</th><td class="num">${cnt(prof.trolley_weekday_boardings_summer2025)}</td><td></td><td></td><td></td></tr>`);
+    body += secWork2(pl);
     return sec('work', 'Who works and shops here', body);
   }
 
@@ -607,7 +609,7 @@
     let body = '';
     const s = storeRows(pl);
     body += table('SNAP-authorized stores open now', [['All SNAP stores', s.n], ['Supermarkets and super stores', s.sup], ['Grocery stores', s.gro], ['Convenience stores', s.conv], ['Dollar, pharmacy and other', s.oth], ['Specialty stores', s.spec], ['Farmers markets', s.fm]]
-      .map(([l, v]) => `<tr><th>${esc(l)}</th><td class="num">${cnt(v || 0)}</td><td></td><td></td><td class="small muted">USDA file, Nov 13, 2026</td></tr>`).join('')) + note('Openings and closings by year come in phase 2 (address-level store history back to 2005).');
+      .map(([l, v]) => `<tr><th>${esc(l)}</th><td class="num">${cnt(v || 0)}</td><td></td><td></td><td class="small muted">USDA file, Nov 13, 2026</td></tr>`).join('')) + snapHistBlock(pl);
     const rec = phlRec(pl); const p = rec && rec.profile;
     if (pl.rec) body += recPermitsLicenses(pl);
     else if (p) {
@@ -679,7 +681,8 @@
     const mmg = pl.county && pl.county.mmg && pl.county.mmg['2024'];
     body += mmg ? table(`County food insecurity (Map the Meal Gap 2024): ${pl.cw.head}`, `<tr><th>Food insecurity, all ages</th><td class="num">${pct1(mmg[0])}</td><td></td><td></td><td class="small muted">about ${cnt(mmg[1])} people · modeled, no margin</td></tr><tr><th>Child food insecurity</th><td class="num">${pct1(mmg[2])}</td><td></td><td></td><td></td></tr><tr><th>Cost per meal</th><td class="num">${mmg[3] ? '$' + mmg[3].toFixed(2) : '–'}</td><td></td><td></td><td></td></tr>`)
       : notHeld('County food insecurity', 'not matched for this county (Connecticut planning regions may use the old county codes)');
-    body += note('WIC stores and school-meal sites (Pennsylvania), SNAP enrollment gap, food stores on the map and by radius: phase 2.');
+    body += foodExtras(pl);
+    body += note('Not built yet: food stores as points on the map and by true circle (counts here are by tract), WIC and school meals outside Pennsylvania (not held).');
     return sec('food', 'Food access', body);
   }
 
@@ -706,6 +709,191 @@
     return sec('health', 'Health (small)', body);
   }
 
+  // ---------------------------------------------------------------- phase 2b: jobs and commuting, transit, food extras
+  const jobsFor = (st) => getFile(`places_jobs_${st}.json.gz`).then(f => f.data);
+  const foodFor = (st) => getFile(`places_food_${st}.json.gz`).then(f => f.data);
+  const foodZips = () => getFile('places_food_zips.json.gz').then(f => f.data);
+  const transitFile = () => getFile('places_transit.json.gz').then(f => f.data);
+  /** the selection transit is counted on: the corridor line (60 m, as the packets), the district boundary, the tracts, or the true circle */
+  function transitSel(pl) {
+    const a = pl.area;
+    if (a && a.kind === 'district') return { kind: 'district', id: a.district_id, words: 'inside the district boundary' };
+    const g = a && (a.pkt_line || (a.kind === 'corridor' ? a.line : null));
+    if (g) return { kind: 'line', geom: g, words: 'within 60 m (200 ft) of the corridor line' };
+    if (pl.kind === 'radius') return { kind: 'radius', lat: pl.center[0], lon: pl.center[1], r: pl.radius, words: `inside the true ${pl.radius.toLocaleString('en-US')} m circle` };
+    if (pl.rows && pl.rows.length) return { kind: 'tracts', tracts: pl.rows.map(r => r[0]), words: pl.rows.length === 1 ? 'in this tract' : `in these ${pl.rows.length} tracts` };
+    return null;
+  }
+  async function attachWork(pl) {
+    pl.wk = { err: {} }; if (!WK) { pl.wk.err.all = 'phase 2b code not loaded'; return; }
+    const W2 = pl.wk;
+    if (pl.kind !== 'zip' && pl.rows && pl.rows.length) {
+      const sts = [...new Set(pl.rows.map(r => ST_FIPS[r[0].slice(0, 2)]).filter(Boolean))];
+      try {
+        const files = {}; for (const st of sts) files[st] = await jobsFor(st);
+        const ix = WK.jobsIndex(files); const pos = {}; const la = pl.ci('lat'), lo = pl.ci('lon');
+        for (const r of pl.rows) if (r[la] !== null && r[la] !== undefined) pos[r[0]] = [r[la], r[lo]];
+        const names = {}; for (const st of sts) { const T = P.tracts[st]; if (T) for (const [t, m] of Object.entries(T.meta)) if (m.n) names[t] = m.n; }
+        W2.J = WK.jobsArea(ix, pl.rows.map(r => r[0]), pos, names);
+        W2.cmpWac = WK.countyWac(ix, pl.cty);
+        W2.day = W2.J ? WK.daytime(pl.W.pop_e, pl.W.pop_m, W2.J) : null;
+      } catch (e) { W2.err.jobs = e.message || String(e); }
+      try {
+        const ids = pl.rows.map(r => r[0]); const F = {}; for (const st of sts) F[st] = await foodFor(st);
+        const hist = Object.assign({}, ...Object.values(F).map(f => f.snap_hist)), gap = Object.assign({}, ...Object.values(F).map(f => f.gap));
+        W2.snap = WK.snapHistory(hist, ids); W2.gap = WK.gapSum(gap, ids);
+        const cmpIds = Object.keys(gap).filter(t => t.startsWith(pl.cty)); W2.gapCmp = WK.gapSum(gap, cmpIds);
+        if (F.PA) {
+          const set = new Set(ids); W2.wic = ids.flatMap(t => (F.PA.wic[t] || []));
+          W2.cep = F.PA.cep.filter(c => set.has(c.t)); W2.cepUnplaced = F.PA.cep_unplaced; W2.wicStats = F.PA.wic_stats;
+          // nearby: placed schools outside these tracts within 800 m of a tract outline (the outlines drawn on the map)
+          const geo = await geoFor('PA'); W2.cepNear = [];
+          if (geo) for (const c of F.PA.cep) { if (set.has(c.t) || c.la === null) continue; let d = Infinity;
+            for (const t of ids) { const rings = geo[t]; if (!rings) continue; for (const ring of rings) { const f = ring[0]; const ln = []; for (let i = 0; i < f.length; i += 2) ln.push([f[i], f[i + 1]]); d = Math.min(d, WK.distToLine(c.la, c.lo, { type: 'LineString', coordinates: ln })); } }
+            if (d <= 800) W2.cepNear.push(Object.assign({}, c, { dm: Math.round(d) })); }
+          W2.cepNear.sort((a, b) => a.dm - b.dm);
+        }
+      } catch (e) { W2.err.food = e.message || String(e); }
+    } else if (pl.kind === 'zip') {
+      try {
+        const Z = await foodZips(); W2.snap = WK.snapHistory(Z.snap_hist, [pl.zip]); W2.gap = WK.gapSum(Z.gap, [pl.zip]);
+        try { const F = await foodFor(ST_FIPS[pl.cty.slice(0, 2)]); W2.gapCmp = WK.gapSum(F.gap, Object.keys(F.gap).filter(t => t.startsWith(pl.cty))); } catch (e) { W2.gapCmp = null; }
+        W2.wicUnplacedZip = Z.wic_unplaced[pl.zip] || [];
+        if (pl.zrec && pl.zrec.st === 'PA') { const F = await foodFor('PA'); W2.wic = Object.values(F.wic).flat().filter(x => x[3] === pl.zip); W2.wicStats = F.wic_stats; }
+      } catch (e) { W2.err.food = e.message || String(e); }
+    }
+    const sel = transitSel(pl); W2.tsel = sel;
+    if (sel) try {
+      const T = await transitFile();
+      const anyPhl = pl.rows && pl.rows.some(r => ['42101', '42045', '42091', '42017', '42029', '34007', '34005', '34015'].includes(r[0].slice(0, 5)));
+      W2.septa = (anyPhl || (pl.area && pl.area.kind === 'district')) ? WK.septaSelect(T, sel) : null;
+      W2.stations = WK.stationsSelect(T, sel, sel.kind === 'line' || sel.kind === 'radius' ? 800 : 0);
+      W2.mbta = pl.rows && pl.rows.some(r => r[0].startsWith('25')) ? WK.mbtaBusSelect(T, sel) : null;
+      W2.transitDocs = { septa: T.septa.season, mbta: T.mbta.doc, path: T.path.doc, mbtaPlaced: T.mbta.bus_placed_share };
+    } catch (e) { W2.err.transit = e.message || String(e); }
+  }
+  // the table head hides when rows stack (iPad portrait, phone), so every 2b table carries a visible heading, as the 2a records tables do
+  const tableH = (head, rows) => `<h4 class="pl-h4">${esc(head)}</h4>` + table(head, rows);
+  const pctS = (x) => x === null || x === undefined ? '–' : (x * 100).toFixed(1) + '%';
+  const yrRow = (o, ys, cls) => ys.map(y => `<span class="${cls || ''}">${y}: <b>${cnt(o[y] || 0)}</b></span>`).join(' · ');
+  function cntyName(J, c) { return (J.countyNames && J.countyNames[c]) || c; }
+
+  function secWork2(pl) {
+    const W2 = pl.wk || { err: {} }; const J = W2.J; const M = P.meeting; let body = '';
+    if (J && J.jobs !== null) {
+      const cw = W2.cmpWac; const base = J.wac[0]; const cbase = cw ? cw[0] : null;
+      const part = (lab, i) => `<tr><th>${esc(lab)}</th><td class="num">${pct1(J.wac[i] / base)}</td><td class="num muted">${cnt(J.wac[i])}</td><td class="num muted">${cbase ? pct1(cw[i] / cbase) : '–'}</td><td class="small muted">count; no survey margin</td></tr>`;
+      body += tableH(`Jobs based here by earnings and age (LODES ${J.year || J.years.join(', ')})`, WK.EARN.map((e, k) => part('Earning ' + e, 4 + k)).join('') + WK.AGE.map((e, k) => part('Workers ' + e, 1 + k)).join(''))
+        + note(`Shares of the ${cnt(base)} jobs based in these tracts; the comparator column is ${esc(pl.cw.label)}. Earnings are monthly pay on the job, before taxes. LODES counts jobs, not people: someone with two jobs counts twice; self-employed people are not counted.`);
+      const wb = J.workBands, hb = J.homeBands;
+      const top = (list, tot) => list.slice(0, 5).map(([c, n]) => `${esc(cntyName(J, c))} <b>${pct1(n / tot)}</b>`).join(' · ');
+      const totW = wb ? wb.slice(0, 10).reduce((a, b) => a + b, 0) : 0;
+      let rows = `<tr><th>Live within 5 km (3 miles)<small>of the tract where they work, center to center</small></th><td class="num">${pctS(WK.shareWithin(wb, 5))}</td><td></td><td></td><td class="small muted">count shares; LODES ${J.year || ''}</td></tr>`
+        + `<tr><th>Live within 10 km (6 miles)</th><td class="num">${pctS(WK.shareWithin(wb, 10))}</td><td></td><td></td><td></td></tr>`
+        + `<tr><th>Half live closer than</th><td colspan="4">${esc(WK.medianBand(wb) || '–')} <span class="muted small">(the median falls in this band)</span></td></tr>`
+        + `<tr><th>Home counties</th><td colspan="4" class="small">${totW ? top(J.workerHomeCounties, totW) : '–'}</td></tr>`;
+      const named = J.nearNeighborhoods.filter(([n]) => !n.startsWith('('));
+      if (named.length && !M) rows += `<tr><th>Nearby home neighborhoods<small>homes within 5 km, where B+W holds a neighborhood name</small></th><td colspan="4" class="small">${named.slice(0, 5).map(([n, k]) => `${esc(n)} <b>${pct1(k / totW)}</b>`).join(' · ')}</td></tr>`;
+      body += tableH(`Where the ${cnt(base)} people who work here live`, rows);
+      const totH = hb ? hb.slice(0, 10).reduce((a, b) => a + b, 0) : 0;
+      if (J.empRes !== null) {
+        let r2 = `<tr><th>Employed residents<small>jobs held by people who live here</small></th><td class="num">${cnt(J.empRes)}</td><td></td><td></td><td class="small muted">LODES ${J.year || ''}</td></tr>`;
+        if (J.pa && J.outOfState !== null) r2 += `<tr><th>Work outside Pennsylvania</th><td class="num">${cnt(J.outOfState)}</td><td></td><td></td><td class="small muted">${pct1(J.outOfState / J.empRes)} of employed residents; where, not held for 2024 (other states' 2024 files are not loaded)</td></tr>`;
+        r2 += `<tr><th>Work within 5 km (3 miles)${J.pa ? '<small>of those working in Pennsylvania</small>' : ''}</th><td class="num">${pctS(WK.shareWithin(hb, 5))}</td><td></td><td></td><td></td></tr>`
+          + `<tr><th>Work within 10 km (6 miles)</th><td class="num">${pctS(WK.shareWithin(hb, 10))}</td><td></td><td></td><td></td></tr>`
+          + `<tr><th>Half work closer than</th><td colspan="4">${esc(WK.medianBand(hb) || '–')}</td></tr>`
+          + `<tr><th>Work counties</th><td colspan="4" class="small">${totH ? J.residentWorkCounties.slice(0, 5).map(([c, n]) => `${esc(cntyName(J, c))} <b>${pct1(n / totH)}</b>`).join(' · ') : '–'}</td></tr>`;
+        body += tableH('Where residents work', r2);
+      }
+      if (W2.day && !M) {
+        const d = W2.day; const rough = d.value > 0 && d.moe90 / d.value > 0.30;
+        // an estimate carries no "solid" verdict: it is marked as an estimate (rough when the residents' margin is over 30% of it)
+        const v = rough ? { cls: 'rough', mark: '≈', word: 'rough estimate' } : { cls: 'plain', mark: '~', word: 'B+W estimate' };
+        let r3 = `<tr class="pl-int"><th>Daytime population, B+W estimate<small>residents + jobs based here − employed residents</small></th><td class="num">${cnt(d.value)}</td><td class="num muted">${cntm(d.moe90)}</td><td></td><td>${vcell(v)}<span class="pl-tag">never quoted, never on a sheet</span></td></tr>`;
+        r3 += `<tr class="pl-int"><th>From</th><td colspan="4" class="small">${cnt(d.residents)} residents (ACS 2020–24) + ${cnt(d.jobs)} jobs − ${cnt(d.empRes)} employed residents (LODES ${J.year || ''})</td></tr>`;
+        if (d.inCommuters !== undefined) r3 += `<tr class="pl-int"><th>Commuting in and out</th><td colspan="4" class="small">${cnt(d.inCommuters)} come in to work · ${cnt(d.outCommuters)} leave to work · ${cnt(d.liveAndWork)} live and work here</td></tr>`;
+        body += tableH('Daytime estimate (internal)', r3) + note(`Method: residents plus everyone whose job is based here, less residents who hold a job (wherever it is). People who live and work here cancel out, so this equals residents + in-commuters − out-commuters. ${d.inCommuters !== undefined ? 'The in and out counts are exact here: every tract of this area is within 5 km of the others, and B+W holds every flow between tracts that close.' : 'In and out counts are shown only where every tract of the area is within 5 km of the others (the flows held exactly).'} The ± is the survey margin on residents only; LODES has none. It mixes a survey (2020–24) with job records (${J.year || ''}), counts jobs rather than people, leaves out the self-employed, students and visitors: a B+W estimate, never a sheet figure.`);
+      }
+      if (J.missing.length) body += note(`${J.missing.length} tract${J.missing.length > 1 ? 's have' : ' has'} no LODES row and ${J.missing.length > 1 ? 'are' : 'is'} left out.`);
+    } else if (pl.kind !== 'zip') body += notHeld('Where workers live and residents work', W2.err.jobs ? `the jobs file is not on this device (${whyFail({ message: W2.err.jobs })}); save it in Data status` : 'not held for these tracts');
+    /* ZIP: the phase 1 "jobs based here" line above already says jobs are held by tract */
+    body += transitBlock(pl);
+    return body;
+  }
+
+  function transitBlock(pl) {
+    const W2 = pl.wk || { err: {} }; const M = P.meeting; const sel = W2.tsel; let out = '';
+    if (!sel) return '';
+    if (W2.err.transit) return notHeld('Transit', `the transit file is not on this device (${whyFail({ message: W2.err.transit })}); save it in Data status`);
+    const s = W2.septa;
+    if (s) {
+      const routes = [...s.busRoutes.map(r => r), ...s.trolleyRoutes].slice(0, 14).join(', ');
+      const okSay = sel.kind === 'line' && s.gates.G3 === 'pass' && s.gates.G5 === 'pass' && s.gates.buffer === 'pass';
+      const street = pl.area ? (pl.area.kind === 'packet' && !M ? pl.area.name : pl.area.name.split(' Business')[0].split(' Special')[0]) : '';
+      const sayL = okSay ? `About ${C.round(s.ons, 100)} transit boardings at ${street} stops each weekday.` : '';
+      let rows = `<tr><th>Weekday boardings, bus and trolley<small>SEPTA, ${esc(W2.transitDocs.septa)}; ${esc(sel.words)}</small></th><td class="num">${cnt(s.ons)}</td><td></td><td></td><td><span class="small muted">at ${cnt(s.stops)} stop${s.stops === 1 ? '' : 's'} (distinct stop codes) </span>${vcell({ cls: 'plain', mark: '·', word: 'count' })}${sel.kind === 'line' ? gateTag(s.gates.G3) + gateTag(s.gates.G5) + gateTag(s.gates.buffer) : ''}${sayL ? '<div>' + say(sayL) + '</div>' : ''}</td></tr>`
+        + `<tr><th>By mode</th><td colspan="4" class="small">${[s.busStops ? `bus <b>${cnt(s.bus)}</b> at ${cnt(s.busStops)} stops` : '', s.trolleyStops ? `trolley <b>${cnt(s.trolley)}</b> at ${cnt(s.trolleyStops)} stops` : ''].filter(Boolean).join(' · ') || 'no stops'}${routes ? ` · routes ${esc(routes)}` : ''}</td></tr>`;
+      if (sel.kind === 'line' && !M) rows += `<tr><th>Second path (CL-20)</th><td colspan="4" class="small">40 m: <b>${cnt(s.at40)}</b> · 60 m: <b>${cnt(s.ons)}</b> · 80 m: <b>${cnt(s.at80)}</b>${s.gates.buffer === 'pass' ? '' : ' · the figure depends on where the line is drawn'}</td></tr>`;
+      if (!M) rows += `<tr><th>Busiest stop</th><td class="num">${cnt(s.topStop)}</td><td></td><td></td><td class="small muted">${pct1(s.topStopShare)} of the boardings</td></tr>`;
+      out += tableH('Transit: boardings by stop', rows);
+    }
+    const st = W2.stations || { in: [], near: [] };
+    const label = (x) => ({ rail_undated: 'SEPTA station (undated count)', regional_rail_2024: 'SEPTA Regional Rail, 2024', gated_fall2025: 'MBTA gated entries, fall 2025', commuter_rail_fall2024: 'MBTA commuter rail, fall 2024', path_2025: 'PATH entries, 2025' }[x.kind]);
+    const stRow = (x, near) => `<tr><th>${esc(x.nm)}<small>${esc(x.ln || '')}${near ? ` · ${cnt(x.dist)} m away, not counted` : ''}</small></th><td class="num">${cnt(x.ons)}</td><td></td><td></td><td class="small muted">${esc(label(x))}</td></tr>`;
+    if (st.in.length || st.near.length) out += tableH('Stations (listed beside the stops, never added to them)', st.in.map(x => stRow(x, false)).join('') + (M ? '' : st.near.slice(0, 6).map(x => stRow(x, true)).join('')))
+      + note(`Stations ${esc(sel.words)} are counted here${sel.kind === 'line' || sel.kind === 'radius' ? '; stations within 800 m are listed as nearby' : ''}. Their counts come from other files and seasons than the stop counts${st.in.concat(st.near).some(x => x.kind === 'rail_undated') ? ' (the SEPTA station layer carries no date)' : ''}, so they are listed beside the stops and never added to them (CL-28).`);
+    if (W2.mbta && (W2.mbta.stops || pl.rows.some(r => r[0].startsWith('25')))) out += tableH('MBTA bus (fall 2025)', `<tr><th>Weekday boardings at MBTA bus stops<small>${esc(sel.words)}; Monday to Thursday average</small></th><td class="num">${cnt(W2.mbta.ons)}</td><td></td><td></td><td class="small muted">at ${cnt(W2.mbta.stops)} stops · routes ${esc(W2.mbta.routes.slice(0, 10).join(', '))}</td></tr>`)
+      + note(`MBTA stop locations come from OpenStreetMap, matched by stop id and name: ${Math.round((W2.transitDocs.mbtaPlaced || 0) * 100)}% of weekday bus boardings are placed; busway berths are placed at their station; the rest are left out, so this can undercount.`);
+    if (!s && !st.in.length && !(W2.mbta && W2.mbta.stops)) out += notHeld('Transit', 'no SEPTA, MBTA or PATH stop or station held here (NJ Transit and the MTA are not loaded)');
+    return out;
+  }
+
+  function snapHistBlock(pl) {
+    const W2 = pl.wk || { err: {} }; const h = W2.snap; const M = P.meeting;
+    if (!h) return note(W2.err.food ? `Store openings and closings: the food file is not on this device (${esc(whyFail({ message: W2.err.food }))}).` : '');
+    if (!h.held) return notHeld('SNAP store openings and closings', 'no SNAP-authorized store has been recorded here since 2005');
+    const Y = [2021, 2022, 2023, 2024, 2025]; const st = WK.steady(Y.map(y => h.open[y]));
+    const yrsAll = []; for (let y = 2005; y <= 2025; y++) yrsAll.push(y);
+    const decades = [2005, 2010, 2015, 2020, 2025];
+    // CL-30 averages round to the ten; for counts this small that misstates them, so an average is offered only at 20 a year or more
+    const avgW = st.steady && st.avg >= 20 ? `steady run: about ${cnt(st.avg10)} a year` : st.steady ? 'steady but small: list the years' : 'not a steady run: list the years, no yearly average';
+    let rows = `<tr><th>Stores that began taking SNAP, by year<small>${avgW}</small></th><td colspan="4" class="small">${yrRow(h.open, Y)} · 2026 to Nov 13: <b>${cnt(h.open[2026])}</b></td></tr>`
+      + `<tr><th>Of those, at the spot of a store that stopped<small>within six months; usually a change of owner</small></th><td colspan="4" class="small">${yrRow(h.openSame, Y)} · 2026: <b>${cnt(h.openSame[2026])}</b></td></tr>`;
+    if (!M) rows += `<tr class="pl-int"><th>Stores that stopped taking SNAP, by year<small>internal: a closure count reads as a decline</small></th><td colspan="4" class="small">${yrRow(h.close, Y)} · 2026 to Nov 13: <b>${cnt(h.close[2026])}</b> · at the spot of a new store: ${Y.map(y => h.closeSame[y]).join(', ')}</td></tr>`
+      + `<tr class="pl-int"><th>Stores taking SNAP on Dec 31<small>internal; counts only, no trend words</small></th><td colspan="4" class="small">${yrRow(h.yearEnd, decades)}</td></tr>`
+      + `<tr><th>Openings, every year since 2005</th><td colspan="4" class="small">${yrsAll.map(y => `${y}: ${h.open[y]}`).join(' · ')}</td></tr>`
+      + `<tr><th>Farmers markets<small>authorize by season; counted apart</small></th><td colspan="4" class="small">began ${Y.map(y => h.fmOpen[y]).join(', ')} (2021–25) · stopped ${Y.map(y => h.fmClose[y]).join(', ')}</td></tr>`;
+    return tableH('SNAP store openings and closings (USDA)', rows) + note(`Counted ${pl.kind === 'zip' ? `by the stores' postal ZIP ${esc(pl.zip)}` : 'by the tract each store sits in'}, all store types but farmers markets; Restaurant Meals Program sites are left out (the history file does not carry them), which is why these do not add up to "open now" above. 2005–2025 from USDA's retailer history (authorization and end dates); 2026 by comparing that history with the Nov 13, 2026 file, so it has no dates within the year and no same point last year. Years are listed and never described as rising or falling.${h.reconciles ? '' : ' One store here sits in a different tract in the two files, so the history and the Nov 13 count differ by one or two.'}`);
+  }
+
+  function foodExtras(pl) {
+    const W2 = pl.wk || { err: {} }; const M = P.meeting; let out = '';
+    const g = W2.gap;
+    if (g && g.share !== null && !M) {
+      const cmp = W2.gapCmp && W2.gapCmp.share !== null ? { area: pl.cw.label, value: W2.gapCmp.share, moe90: W2.gapCmp.shareMoe } : null;
+      const f = { id: 'x_gap', value: g.share, moe90: g.shareMoe, comparator: cmp, label: 'Below-poverty households not receiving SNAP', flags: { internal: true } };
+      out += tableH('SNAP gap (survey; internal)', shareRow(f, pl, { internal: true, note: `${cnt(g.notReceiving)} ${cntm(g.notReceivingMoe)} of ${cnt(g.below)} ${cntm(g.belowMoe)} households below the poverty line; B22003` }))
+        + note('What this is: households whose income was below the poverty line and that did not receive SNAP in the past 12 months, as a share of all households below the poverty line (Census table B22003, 2020–24). Every one of them meets SNAP\'s income test, but immigration status, student rules and assets can still bar some, and households between 100% and 200% of poverty that qualify under state rules are not counted. It is a survey share with its margin, not an estimate of eligible people: B+W does not estimate eligibility. Internal: it rests on poverty.');
+    }
+    if (W2.wic) {
+      const list = W2.wic.slice(0, 10).map(x => `${esc(x[0])} <span class="muted">(${esc(x[1])})</span>`).join(' · ');
+      out += tableH('WIC (Pennsylvania)', `<tr><th>SNAP stores that also take WIC<small>${pl.kind === 'zip' ? 'in the postal ZIP' : 'in these tracts'}; state WIC list, Nov 14, 2026</small></th><td class="num">${cnt(W2.wic.length)}</td><td></td><td></td><td class="small">${list || '<span class="muted">none</span>'}${W2.wic.length > 10 ? ' …' : ''}</td></tr>`
+        + (W2.wicUnplacedZip && W2.wicUnplacedZip.length ? `<tr><th>WIC stores not matched to a SNAP store</th><td class="num">${W2.wicUnplacedZip.length}</td><td></td><td></td><td class="small">${W2.wicUnplacedZip.map(x => esc(x[0])).join(' · ')}</td></tr>` : ''))
+        + (W2.wicStats ? note(`${cnt(W2.wicStats.state_list)} stores are on the state WIC list; ${cnt(W2.wicStats.matched_wic_stores)} matched a SNAP store and are placed by it. The other ${cnt(W2.wicStats.unmatched_wic_stores)} count on ZIP cards only.`) : '');
+    }
+    if (W2.cep) {
+      const part = W2.cep.filter(c => c.cp), elig = W2.cep.filter(c => !c.cp && (c.el || c.ne));
+      const en = part.reduce((a, c) => a + (c.en || 0), 0); const isp = part.map(c => c.isp).filter(x => x !== null);
+      const nm = (c) => `${esc(c.n)}${c.isp !== null ? ` <span class="muted">${c.isp.toFixed(0)}%</span>` : ''}`;
+      let rows = `<tr><th>Schools where every student eats free (CEP)<small>in these tracts; school year 2026–27</small></th><td class="num">${cnt(part.length)}</td><td></td><td></td><td class="small"><span class="muted">${cnt(en)} students enrolled · </span>${part.slice(0, 8).map(nm).join(' · ') || '<span class="muted">none placed here</span>'}${part.length > 8 ? ' …' : ''}</td></tr>`;
+      if (isp.length) rows += `<tr><th>Identified-student share<small>students certified without an application (SNAP, TANF, foster)</small></th><td colspan="4">${isp.length > 1 ? `${Math.min(...isp).toFixed(0)}% to ${Math.max(...isp).toFixed(0)}%` : isp[0].toFixed(0) + '%'}</td></tr>`;
+      if (elig.length) rows += `<tr><th>Eligible or near eligible, not taking part</th><td class="num">${cnt(elig.length)}</td><td></td><td></td><td class="small">${elig.slice(0, 6).map(nm).join(' · ')}</td></tr>`;
+      if (W2.cepNear && W2.cepNear.length) rows += `<tr><th>Nearby (within 800 m of these tracts)</th><td class="num">${cnt(W2.cepNear.filter(c => c.cp).length)}</td><td></td><td></td><td class="small">${W2.cepNear.filter(c => c.cp).slice(0, 6).map(c => `${nm(c)} <span class="muted">${c.dm} m</span>`).join(' · ')}</td></tr>`;
+      out += tableH('School meals (Pennsylvania)', rows) + note(`Pennsylvania Department of Education CEP list. Sites are placed by matching the school's name inside its district (NCES and City school locations); ${cnt(W2.cepUnplaced.participating)} participating sites statewide could not be placed (mostly Archdiocese, residential and suburban sites), so a count here can be short.`);
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------- map (B+W geometry; street tiles optional)
   async function drawMap(pl) {
     const el = $('#plMap'); if (!el || !window.L) return;
@@ -722,6 +910,11 @@
     }
     if (pl.area && pl.area.boundary) layers.push(L.geoJSON(pl.area.boundary, { style: { color: '#9C5B3A', weight: pl.area.line ? 1 : 3, dashArray: pl.area.line ? '4 3' : null, fill: true, fillOpacity: 0.05 } }));
     if (pl.area && pl.area.line) layers.push(L.geoJSON(pl.area.line, { style: { color: '#9C5B3A', weight: 4, lineCap: 'round' } }));
+    else if (pl.area && pl.area.pkt_line) layers.push(L.geoJSON(pl.area.pkt_line, { style: { color: '#9C5B3A', weight: 4, lineCap: 'round' } }));
+    // phase 2b: stations counted here (dark squares) and community-eligibility schools (open circles); markers do not change the map's extent
+    const marks = [];
+    if (pl.wk && pl.wk.stations) for (const x of pl.wk.stations.in) marks.push(L.circleMarker([x.la, x.lo], { radius: 5, color: '#2A1E16', weight: 2, fillColor: '#2A1E16', fillOpacity: 0.9 }).bindTooltip(`${x.nm}: ${Math.round(x.ons || 0).toLocaleString('en-US')} a weekday`));
+    if (pl.wk && pl.wk.cep) for (const c of pl.wk.cep.filter(c => c.cp)) marks.push(L.circleMarker([c.la, c.lo], { radius: 4, color: '#5A4332', weight: 2, fill: true, fillColor: '#F2EBDC', fillOpacity: 1 }).bindTooltip(c.n + ' (school meals for all)'));
     if (pl.center) { layers.push(L.circle(pl.center, { radius: pl.radius, color: '#2A1E16', weight: 1, dashArray: '4 4', fill: false })); layers.push(L.circleMarker(pl.center, { radius: 6, color: '#fff', weight: 2, fillColor: '#2A1E16', fillOpacity: 1 })); }
     if (!layers.length && pl.rows.length) for (const r of pl.rows) { const la = r[pl.ci('lat')], lo = r[pl.ci('lon')]; if (la !== null) layers.push(L.circleMarker([la, lo], { radius: 5, color: '#9C5B3A' })); }
     // bounds before adding: a circle has no bounds until the map has a view (Leaflet), so use its own extent
@@ -729,13 +922,14 @@
     for (const l of layers) { const b = l instanceof L.Circle ? L.latLng(pl.center).toBounds(pl.radius * 2) : (l.getBounds ? l.getBounds() : L.latLngBounds([l.getLatLng(), l.getLatLng()])); bb = bb ? bb.extend(b) : L.latLngBounds(b.getSouthWest(), b.getNorthEast()); }
     if (bb) m.fitBounds(bb, { padding: [12, 12], maxZoom: 15 });
     L.featureGroup(layers).addTo(m);
+    if (marks.length) L.featureGroup(marks).addTo(m);
     if (layers.length) { /* drawn */ } else if (pl.kind === 'zip') { el.innerHTML = '<p class="muted small" style="padding:10px">ZIP outlines are not drawn in phase 1.</p>'; }
     setTimeout(() => m.invalidateSize(), 80);
   }
 
   // ---------------------------------------------------------------- data status
-  const FILES_COMMON = ['places_meta.json.gz', 'places_areas.json.gz', 'places_counties.json.gz', 'places_phl.json.gz', 'places_zips.json.gz'].concat(PTS);
-  const stateFiles = (st) => [`places_tracts_${st}.json.gz`, `places_geo_${st}.json.gz`];
+  const FILES_COMMON = ['places_meta.json.gz', 'places_areas.json.gz', 'places_counties.json.gz', 'places_phl.json.gz', 'places_zips.json.gz'].concat(PTS, ['places_food_zips.json.gz', 'places_transit.json.gz']);
+  const stateFiles = (st) => [`places_tracts_${st}.json.gz`, `places_geo_${st}.json.gz`, `places_jobs_${st}.json.gz`, `places_food_${st}.json.gz`];
   async function renderStatus() {
     const box = $('#placesStatus'); const meta = await metaFile().catch(() => null);
     const files = meta ? meta.files.map(f => f.file) : FILES_COMMON.concat(HOME.flatMap(stateFiles));
