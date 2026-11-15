@@ -1,4 +1,4 @@
-/* B+W Field Guide, Places: core figures and margin rules (v1.0, Nov 2026).
+/* B+W Field Guide, Places: core figures and margin rules (v1.1, Nov 2026).
    A JavaScript copy of the packet builder's survey rules (templates/builder/lib/select.py and fmt.py, Nov 14 version):
    sums with root-sum-of-squares margins, the Census proportion formula, gates G2, G3, G5 and the decade-change test.
    The release test (test/places_gate.mjs) rebuilds the 14 packets' survey figures from the snapshot files with these
@@ -80,11 +80,21 @@
     asian: ['anh_e', 'anh_m', 'pop_e', 'pop_m', 'Asian, not Hispanic', 'B03002 (curated)', 'person', { internal: true, notsheet: 'race' }],
   };
   const ENROLL = [['enr_pre', 'Nursery or preschool'], ['enr_k', 'Kindergarten'], ['enr_18', 'Grades 1 to 8'], ['enr_912', 'Grades 9 to 12'], ['enr_col', 'College or graduate school']];
+  // School enrollment by level, by tract (B14007, added Nov 14 night). Shares of everyone enrolled (age 3+), plus the college share of residents 3+.
+  // id: [num, num moe, base, base moe, label]
+  const ENROLL_T = {
+    en_pre: ['enp_e', 'enp_m', 'enr_e', 'enr_m', 'Preschool (nursery school)'],
+    en_k12: ['enk12_e', 'enk12_m', 'enr_e', 'enr_m', 'Kindergarten to grade 12'],
+    en_ug: ['enug_e', 'enug_m', 'enr_e', 'enr_m', 'Undergraduate college'],
+    en_gr: ['engr_e', 'engr_m', 'enr_e', 'enr_m', 'Graduate or professional school'],
+    en_college: ['encol_e', 'encol_m', 'en3_e', 'en3_m', 'In college or graduate school, among residents 3 and over'],
+  };
 
   // ------------------------------------------------------------------ sums (queries.sql A, agg CTE)
   const SUMMED = ['pop_e', 'hh_e', 'hhk_e', 'occ_e', 'nv_e', 'rent_e', 'a1824_e', 'u18_e', 'a65_e', 'a25_e', 'fb_e', 'nat_e', 'ncit_e', 'wk_e', 'tw_e', 'da_e', 'wfh_e',
     'sn0_e', 'sn_e', 'pvu_e', 'pv_e', 'c5_e', 'lo_e', 'lvw_e', 'ai_e', 'hu_e', 'ba_e', 'hsp_e', 'wnh_e', 'bnh_e', 'anh_e',
-    'hh18_e', 'pop18_e', 'fb18_e', 'nv18_e', 'sn18_e'];
+    'hh18_e', 'pop18_e', 'fb18_e', 'nv18_e', 'sn18_e',
+    'en3_e', 'enr_e', 'enp_e', 'enk12_e', 'enug_e', 'engr_e', 'encol_e', 'en318_e', 'enr18_e', 'col18_e'];
   const PLAIN = ['cur_pop', 'cur_hh', 'hh18hu_e', 'core18_hu', 'p20', 'pop2020', 'snap_n', 'snap_sup', 'snap_gro', 'snap_conv', 'snap_fm', 'snap_spec', 'snap_oth', 'snap_rmp',
     'lf', 'lf_snap', 'lf_wic', 'lf_fmnp', 'jobs'];
 
@@ -133,7 +143,7 @@
   /** W: area sums, Cm: comparator sums, cmpMedian {e,m}, cmpLabel; returns {figs, notes} in figures.json shape (survey part) */
   function makeFigures(W, Cm, cmpMedian, cmpLabel) {
     const figs = {}; const notes = [];
-    const fig = (name, value, kw = {}) => { figs[name] = Object.assign({ value, moe90: null, comparator: null, test: null }, kw); return figs[name]; };
+    const fig = (name, value, kw = {}) => { figs[name] = Object.assign({ id: name, value, moe90: null, comparator: null, test: null }, kw); return figs[name]; };
     const pop = W.pop_e, popm = W.pop_m, hh = W.hh_e, hhm = W.hh_m;
     fig('res_wa', pop, { moe90: popm, comparator: { area: cmpLabel, value: Cm.pop_e, moe90: Cm.pop_m }, format: 'residents' });
     fig('hh_wa', hh, { moe90: hhm, comparator: { area: cmpLabel, value: Cm.hh_e, moe90: Cm.hh_m }, format: 'r100' });
@@ -221,6 +231,18 @@
       fig(`x_${id}`, p, { moe90: pm, comparator: hasC ? { area: cmpLabel, value: pc, moe90: pcm } : null, count: W[xk], count_moe: W[xm], label, table: tbl, unit, flags: fl, format: 'share',
         test: { ratio: pc ? p / pc : null, beyond_margin: hasC ? Math.abs(p - pc) > rss(pm, pcm) : null } });
     }
+    // school enrollment by level, by tract (B14007): same share tests, no strength tag (not a packet trait)
+    if (W.enr_e) for (const [id, [xk, xm, nk, nm, label]] of Object.entries(ENROLL_T)) {
+      if (!W[nk] || W[xk] === null || W[xk] === undefined) continue;
+      const p = W[xk] / W[nk], pm = propMoe(W[xk], W[xm], W[nk], W[nm]);
+      const hasC = Cm && Cm[nk] && Cm[xk] !== null && Cm[xk] !== undefined;
+      const pc = hasC ? Cm[xk] / Cm[nk] : null, pcm = hasC ? propMoe(Cm[xk], Cm[xm], Cm[nk], Cm[nm]) : null;
+      fig(`x_${id}`, p, { moe90: pm, comparator: hasC ? { area: cmpLabel, value: pc, moe90: pcm } : null, count: W[xk], count_moe: W[xm], label, table: 'B14007', unit: 'person',
+        flags: { enroll: true }, format: 'share', test: { ratio: pc ? p / pc : null, beyond_margin: hasC ? Math.abs(p - pc) > rss(pm, pcm) : null } });
+    }
+    // college and graduate students a decade ago (2014-18 B14007 moved to 2020 tracts with the same population-weight crosswalk)
+    if (W.col18_e !== null && W.col18_e !== undefined && W.encol_e !== null && W.encol_e !== undefined && Cm && Cm.col18_e && Cm.encol_e !== null && Cm.encol_e !== undefined)
+      change('col_change', W.encol_e, W.encol_m, W.col18_e, W.col18_m, Cm.encol_e, Cm.col18_e, 'College and graduate students, 2014-18 to 2020-24');
     // jobs (M3): count, top tract share
     if (W.jobs !== null && W.jobs !== undefined) {
       const top = W.tract_traits.reduce((a, r) => r.jobs > a.jobs ? r : a, { jobs: -1 });
@@ -253,11 +275,29 @@
   function changeVerdict(f) {
     if (!f || !f.test) return { word: 'not held', cls: 'none', mark: '–' };
     if (!f.test.measurable) return { word: 'no measurable change', cls: 'inside', mark: '=', detail: 'the change is inside 1.1 times its combined margin' };
+    // households (packet gate G2b): a rise must also clear 1.1 times the margin with the 2014-18 occupancy rate held
+    const t = f.test;
+    if (f.value > 0 && t.delta_occupancy_held !== undefined && !(t.delta_occupancy_held > 1.1 * t.moe))
+      return { word: 'not firm: inside the margin once occupancy is held', cls: 'inside', mark: '=',
+        detail: 'with the 2014-18 occupancy rate the change is ' + Math.round(t.delta_occupancy_held), held: true };
     if (f.value < 0) return { word: 'measurable decline', cls: 'solid', mark: '↓', tag: 'not for a sheet (declines)' };
     return { word: 'measurable rise', cls: 'solid', mark: '↑' };
   }
 
-  const Core = { rss, propMoe, hu, pct0, comma, round, fraction, sharePhrase, usdK, usdBig, residents, TRAITS, NEED, EXTRA, ENROLL, aggregate, concentration, makeFigures, verdict, changeVerdict, VERSION: '1.0.0' };
+  /** the working tag beside a solid share (design 3.4 plus packet gates G5, one-use and the renters rule; review defect 5).
+      id: the figure id (trait_x, x_y); v: verdict(f). Returns the tag text or null. Only packet traits carry a strength tag. */
+  function sheetTag(id, f, v) {
+    if (!v || v.cls !== 'solid' || !v.tag) return null;
+    if (!id.startsWith('trait_')) return null;
+    const g = (f.test && f.test.gates) || {};
+    if (g['G6-one-use']) return 'used as a need fact: off the front';
+    if (f.comparator && f.value < f.comparator.value) return `below ${f.comparator.area === 'Philadelphia' ? 'the city' : f.comparator.area}: not for the front`;
+    if (f.test && f.test.concentration && !f.test.concentration.pass) return null;     // the "concentrated" tag says why
+    if (id === 'trait_renters' && v.tag === 'sheet strength') return 'support only';   // renters are never lead-eligible (spec)
+    return v.tag;
+  }
+
+  const Core = { rss, sheetTag, propMoe, hu, pct0, comma, round, fraction, sharePhrase, usdK, usdBig, residents, TRAITS, NEED, EXTRA, ENROLL, ENROLL_T, aggregate, concentration, makeFigures, verdict, changeVerdict, VERSION: '1.1.0' };
   if (typeof module !== 'undefined' && module.exports) module.exports = Core;
   else root.BWPlacesCore = Core;
 })(typeof self !== 'undefined' ? self : this);

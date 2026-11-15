@@ -28,7 +28,7 @@
 .pl-t .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .pl-t tr.pl-sub th{font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--sienna);padding-top:12px;border-bottom:0}
 .pl-t tr.pl-int th{color:var(--muted)}
-.pl-v{white-space:nowrap}
+.pl-v{white-space:normal}
 .pl-v b{display:inline-block;width:1em;text-align:center}
 .pl-v.solid{color:var(--ok)}
 .pl-v.rough{color:var(--muted)}
@@ -45,12 +45,15 @@
 .pl-top li{margin:1px 0}
 .pl-files th{font-weight:400}
 .pl-foot{padding:0 4px}
-/* phone: each row stacks (measure, then figure · margin · comparator, then the verdict and sentence); no sideways scrolling */
-@media (max-width:560px){
-  .pl-t{font-size:.84rem}
+/* phone and iPad portrait (820 px and narrower): each row stacks (measure, then figure · margin · comparator, then the verdict
+   and sentence), so the verdict column is never cut off and nothing scrolls sideways */
+@media (max-width:900px){
+  .pl-t{font-size:.9rem}
   .pl-t thead{display:none}
   .pl-t thead+tbody tr:first-child{border-top:1px solid var(--line)}
-  .pl-t tr{display:grid;grid-template-columns:auto auto 1fr;gap:2px 10px;padding:7px 0;border-bottom:1px solid var(--line)}
+  .pl-t tr{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:2px 10px;padding:7px 0;border-bottom:1px solid var(--line)}
+  .pl-t td{min-width:0;overflow-wrap:anywhere}
+  .pl-t td.num:nth-of-type(3){white-space:normal}
   .pl-t th,.pl-t td{border:0;padding:0}
   .pl-t tbody th{grid-column:1/-1;min-width:0}
   .pl-t td:nth-of-type(3){text-align:right}
@@ -62,3 +65,7 @@
 }
 .pl-tools label{display:flex;align-items:center;gap:6px}
 .pl-tools input[type=checkbox]{width:auto;margin:0;flex:none}
+.pl-gps{margin:6px 0}
+.pl-gps.warn{color:var(--warn)}
+.pl-chip[title]{cursor:pointer}
+@media (min-width:561px) and (max-width:900px){.pl-t{font-size:.95rem}.pl-t tbody th small{font-size:.8rem}}

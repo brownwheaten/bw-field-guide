@@ -35,7 +35,7 @@ const EXPLAINED = (pkt, fid, key, a, b) => EXPL.find(e => e.packets.includes(pkt
 const SURVEY = ['res_wa', 'hh_wa', 'agg_income', 'hh_change', 'pop_change', 'fb_change', 'trait_born_abroad', 'trait_lang_other', 'trait_no_car', 'trait_u18', 'trait_a1824',
   'trait_a65', 'trait_transit_walk', 'trait_renters', 'need_no_car', 'need_snap', 'need_lvw', 'need_kids', 'need_a65', 'tract_median_range', 'cmp_median', 'hh18_base',
   'pop18_base', 'fb18_base', 'n_tracts', 'jobs'];
-const report = { run: new Date().toISOString(), tolerance_rel: REL, packets: [], totals: { compared: 0, matched: 0, mismatched: 0, printed_mismatch: 0 } };
+const report = { run: new Date().toISOString(), tolerance_rel: REL, packets: [], totals: { compared: 0, matched: 0, mismatched: 0, printed_mismatch: 0 }, verdicts: { compared: 0, ok: 0, failed: 0 } };
 
 for (const dir of fs.readdirSync(pktDir).sort()) {
   const fp = path.join(pktDir, dir, 'figures.json');
@@ -80,10 +80,28 @@ for (const dir of fs.readdirSync(pktDir).sort()) {
     const pf = PF['trait_' + t], af = figs['trait_' + t]; if (!pf || !af) continue;
     chk('trait_' + t, 'printed.share_phrase', Core.sharePhrase(af.value, af.unit, af.verbs), Core.sharePhrase(pf.value, af.unit, af.verbs), true);
   }
+  // verdict consistency (counted apart from the figure checks above): what the card says must not outrun the packet's gates.
+  // 1. A household "measurable rise" needs both packet G2 gates (survey margin, and with the 2014-18 occupancy rate held).
+  // 2. A "sheet strength" or "support only" tag needs the packet's G2 and G5 to pass and no one-use (G6) block.
+  const vchk = (what, ok, detail) => { report.verdicts.compared++; if (ok) report.verdicts.ok++; else { report.verdicts.failed++; res.verdict_failures = res.verdict_failures || []; res.verdict_failures.push({ what, detail }); } };
+  if (figs.hh_change && PF.hh_change) {
+    const w = Core.changeVerdict(figs.hh_change).word; const g = PF.hh_change.test.gates || {};
+    const firm = status(g.G2) === 'pass' && (g['G2-occupancy-held'] === undefined || status(g['G2-occupancy-held']) === 'pass');
+    vchk('hh_change verdict', w !== 'measurable rise' || firm, `card "${w}", packet G2 ${status(g.G2)}, G2-occupancy-held ${status(g['G2-occupancy-held'])}`);
+  }
+  for (const t of Object.keys(Core.TRAITS)) {
+    const af = figs['trait_' + t], pf = PF['trait_' + t]; if (!af || !pf) continue;
+    const tag = Core.sheetTag('trait_' + t, af, Core.verdict(af, 'share')); const g = (pf.test && pf.test.gates) || {};
+    const okGates = status(g.G2) === 'pass' && status(g.G5) !== 'FAIL' && status(g['G6-one-use']) !== 'FAIL';
+    vchk('trait_' + t + ' tag', !(tag === 'sheet strength' || tag === 'support only') || okGates, `card tag "${tag}", packet G2 ${status(g.G2)}, G5 ${status(g.G5)}, G6 ${status(g['G6-one-use'])}`);
+    if (tag === 'sheet strength') vchk('trait_' + t + ' lead', status(g.G3) === 'pass' && af.test && Core.TRAITS[t][5], `packet G3 ${status(g.G3)}`);
+  }
   report.packets.push(res);
   console.log(`${res.mismatches.length ? 'FAIL' : 'ok  '} ${dir.padEnd(32)} ${res.checks.length} checks, ${res.mismatches.length} mismatches, ${(res.explained || []).length} explained${missing.length ? ', missing tracts ' + missing.join(' ') : ''}`);
   for (const m of res.mismatches.slice(0, 12)) console.log('       ', m.fid, m.key, 'places=', m.places, 'packet=', m.packet);
+  for (const m of (res.verdict_failures || [])) console.log('        VERDICT', m.what, m.detail);
 }
 console.log(`\n${report.totals.compared} checks, ${report.totals.matched} match, ${report.totals.explained || 0} explained variance, ${report.totals.mismatched} unexplained mismatch (${report.totals.printed_mismatch} on a printed value)`);
+console.log(`verdict consistency: ${report.verdicts.compared} checks, ${report.verdicts.ok} ok, ${report.verdicts.failed} failed`);
 if (reportPath) fs.writeFileSync(reportPath, JSON.stringify(report, null, 1));
-process.exit(report.totals.mismatched ? 1 : 0);
+process.exit(report.totals.mismatched || report.verdicts.failed ? 1 : 0);
