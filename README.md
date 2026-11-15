@@ -17,3 +17,12 @@ what's opening and closing, property and money, food access and a small health s
 - `places.js`, `places.css`: the tab, loaded only when it opens.
 - Data: snapshot files are built outside this repository and kept in the owner's Google Drive; the backend action `placesFile` serves them to a
   signed-in device, which keeps them encrypted for offline use. No figures are stored in this repository.
+
+## Places phase 2a (branch `places-v2`, app 1.7.0)
+
+- `places-records.js`: Philadelphia address records (licenses, permits, parcels, deeds, SBA loans, storefront grants) counted for any
+  corridor (its address rule, as the packets count), district (inside the City boundary), tract or neighborhood, or the true circle around
+  Here. Counts by year, no yearly average unless the run is steady, no direction words, and the packets' gates shown as tags.
+- `test/places_gate.mjs` now also rebuilds the packets' records figures and the district tables' counts from the point snapshots.
+- Districts with a published corridor carry a corridor line and its tract list; area districts stay on the boundary rule, marked desk only.
+- The point snapshots, like the rest, are built outside this repository and kept in the owner's Google Drive.

@@ -101,7 +101,82 @@ for (const dir of fs.readdirSync(pktDir).sort()) {
   for (const m of res.mismatches.slice(0, 12)) console.log('       ', m.fid, m.key, 'places=', m.places, 'packet=', m.packet);
   for (const m of (res.verdict_failures || [])) console.log('        VERDICT', m.what, m.detail);
 }
+// ---------------------------------------------------------------- records (phase 2): permits, licenses, property, loans, grants
+// For every packet whose area carries an address rule (places_areas.json.gz, kind "packet"), count the Philadelphia point snapshots with
+// places-records.js and compare with the packet's inputs.json records block. Then, for the 17 City districts, compare the inside-boundary
+// counts with the phase 1 district tables (places_phl.json.gz). Counted apart from the survey checks so those totals stay comparable.
+const Rec = require('../places-records.js');
+report.records = { compared: 0, matched: 0, explained: 0, mismatched: 0, packets: [], districts: [] };
+if (fs.existsSync(path.join(snapDir, 'places_pts_meta.json.gz'))) {
+  const R = Rec.load({ meta: gz('places_pts_meta.json.gz'), lic: gz('places_pts_lic.json.gz'), permits: gz('places_pts_permits.json.gz'), parcels: gz('places_pts_parcels.json.gz'),
+    sales: gz('places_pts_sales.json.gz'), small: gz('places_pts_small.json.gz') });
+  const areas = gz('places_areas.json.gz').areas;
+  const rchk = (bucket, who, key, a, b) => {
+    report.records.compared++; const ok = JSON.stringify(a) === JSON.stringify(b);
+    if (ok) { report.records.matched++; bucket.checks.push([key, true]); return; }
+    // a number within its listed tolerance, or a printed sentence listed as "text" (the packet's wording is the documented exception)
+    const e = EXPL.find(x => x.records && x.packets.includes(who) && key in x.keys && ((x.keys[key] === 'text' && Array.isArray(a)) || (typeof a === 'number' && typeof b === 'number' && Math.abs(a - b) <= x.keys[key])));
+    if (e) { report.records.explained++; (bucket.explained ||= []).push({ key, places: a, packet: b, reason: e.reason }); return; }
+    report.records.mismatched++; bucket.mismatches.push({ key, places: a, packet: b });
+  };
+  const yr = (o, ys) => ys.map(y => (o || {})[y] || 0);
+  for (const dir of fs.readdirSync(pktDir).sort()) {
+    const ip = path.join(pktDir, dir, 'inputs.json'); if (dir.startsWith('_') || !fs.existsSync(ip)) continue;
+    const I = JSON.parse(fs.readFileSync(ip)); const RI = I.records || {}; const key = (I.meta && I.meta.district_key) || dir;
+    const a = areas.find(x => x.id === 'pkt:' + key); if (!a || !a.addr) continue;
+    const S = Rec.summarize(R, { kind: 'addr', parts: a.addr.parts });
+    const b = { packet: dir, parts: a.addr.parts, checks: [], mismatches: [] };
+    const Y = ['2021', '2022', '2023', '2024', '2025'];
+    if (RI.permits) {
+      const p = RI.permits; rchk(b, dir, 'permits.by_year', yr(S.permits.by_year, Y), Y.map(y => p.by_year[y]));
+      rchk(b, dir, 'permits.ytd', [S.permits.ytd.this, S.permits.ytd.last, S.permits.ytd.through], [p.ytd.this, p.ytd.last, p.ytd.through]);
+      rchk(b, dir, 'permits.top_address_n', S.permits.top_address_n, p.top_address_n); rchk(b, dir, 'permits.top_address', S.permits.top_address, p.top_address);
+      if (p.file_max) rchk(b, dir, 'permits.file_max', S.permits.as_of, p.file_max);
+      // the printed claim 3 (rule S1): lead and support as the packet printed them
+      const F = JSON.parse(fs.readFileSync(path.join(pktDir, dir, 'figures.json')));
+      const c3 = Object.values(F.text || {}).flat().find(x => x && typeof x === 'object' && x.slot === 'F7.3' && x.rule === 'S1');
+      if (c3) { const sy = Rec.permitsSay(S.permits, `${F.meta.street} addresses`); rchk(b, dir, 'permits.printed_claim3', [sy.lead, sy.support], [c3.lead, c3.support]); }
+    }
+    if (RI.food_licenses_active) {
+      const l = RI.food_licenses_active; rchk(b, dir, 'lic.food_active', S.licenses.food_active, l.n); rchk(b, dir, 'lic.food_addresses', S.licenses.food_addresses, l.k);
+      if (l.asof) rchk(b, dir, 'lic.as_of', S.licenses.as_of, l.asof);
+    }
+    if (RI.licenses_first_issued) rchk(b, dir, 'lic.first_issued', yr(S.licenses.first_issued, Y), Y.map(y => RI.licenses_first_issued.by_year[y]));
+    if (RI.sba) {
+      const s = RI.sba; rchk(b, dir, 'sba.n_since_fy2020', S.loans.n_since_fy2020, s.n_since_fy2020); rchk(b, dir, 'sba.k_addresses', S.loans.k_addresses, s.k_addresses);
+      rchk(b, dir, 'sba.top_address_n', S.loans.top_address_n, s.top_address_n);
+      if (s.latest) rchk(b, dir, 'sba.latest', s.latest.length === 7 ? (S.loans.latest || '').slice(0, 7) : S.loans.latest, s.latest);
+      if (s.dollars_since !== undefined && s.dollars_since !== null) rchk(b, dir, 'sba.dollars_since', S.loans.dollars_since, s.dollars_since);
+      if (s.asof) rchk(b, dir, 'sba.as_of', S.loans.as_of, s.asof);
+    }
+    if (RI.properties) {
+      const q = RI.properties; rchk(b, dir, 'property.n', S.property.n, q.n); rchk(b, dir, 'property.owners', S.property.owners_raw, q.owners);
+      rchk(b, dir, 'property.owners_print', S.property.owners_print, q.owners_print); rchk(b, dir, 'property.top_owner_n', S.property.top_owner_n, q.top_owner_n);
+    }
+    if (RI.grants && typeof RI.grants.n === 'number') rchk(b, dir, 'grants.n', S.grants.n, RI.grants.n);
+    report.records.packets.push(b);
+    console.log(`${b.mismatches.length ? 'FAIL' : 'ok  '} records ${dir.padEnd(28)} ${b.checks.length + b.mismatches.length + (b.explained || []).length} checks, ${b.mismatches.length} mismatches, ${(b.explained || []).length} explained`);
+    for (const m of b.mismatches) console.log('        ', m.key, 'places=', JSON.stringify(m.places), 'packet=', JSON.stringify(m.packet));
+  }
+  // the 17 City districts: inside-boundary counts against the phase 1 district tables
+  const phl = gz('places_phl.json.gz').districts;
+  for (const [id, d] of Object.entries(phl)) {
+    const p = d.profile; if (!p || !p.district_id) continue;
+    const S = Rec.summarize(R, { kind: 'district', id });
+    const b = { district: id, checks: [], mismatches: [] }; const who = 'district:' + id;
+    const Y = [2021, 2022, 2023, 2024, 2025];
+    rchk(b, who, 'district.permits', Y.map(y => S.permits.by_year[y] || 0), Y.map(y => p['permits_' + y]));
+    rchk(b, who, 'district.new_food_lic_store4', Y.map(y => S.licenses.first_issued_store4[y] || 0).concat([S.licenses.first_issued_store4[2026] || 0]), Y.map(y => p['new_food_lic_' + y]).concat([p.new_food_lic_2026_ytd]));
+    rchk(b, who, 'district.storefront_grants', S.grants.n, p.storefront_grants);
+    rchk(b, who, 'district.storefront_grant_usd', S.grants.dollars, Math.round(p.storefront_grant_usd || 0));
+    rchk(b, who, 'district.nonres_parcels', S.property.nonres, p.nonres_parcels);
+    report.records.districts.push(b);
+    console.log(`${b.mismatches.length ? 'FAIL' : 'ok  '} records district ${id.padEnd(19)} ${b.checks.length + b.mismatches.length + (b.explained || []).length} checks, ${b.mismatches.length} mismatches, ${(b.explained || []).length} explained`);
+    for (const m of b.mismatches) console.log('        ', m.key, 'places=', JSON.stringify(m.places), 'table=', JSON.stringify(m.packet));
+  }
+  console.log(`records: ${report.records.compared} checks, ${report.records.matched} match, ${report.records.explained} explained, ${report.records.mismatched} unexplained mismatch`);
+} else console.log('records: point snapshots not in this folder; records checks skipped');
 console.log(`\n${report.totals.compared} checks, ${report.totals.matched} match, ${report.totals.explained || 0} explained variance, ${report.totals.mismatched} unexplained mismatch (${report.totals.printed_mismatch} on a printed value)`);
 console.log(`verdict consistency: ${report.verdicts.compared} checks, ${report.verdicts.ok} ok, ${report.verdicts.failed} failed`);
 if (reportPath) fs.writeFileSync(reportPath, JSON.stringify(report, null, 1));
-process.exit(report.totals.mismatched || report.verdicts.failed ? 1 : 0);
+process.exit(report.totals.mismatched || report.verdicts.failed || report.records.mismatched ? 1 : 0);

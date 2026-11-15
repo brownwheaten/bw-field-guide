@@ -69,3 +69,6 @@
 .pl-gps.warn{color:var(--warn)}
 .pl-chip[title]{cursor:pointer}
 @media (min-width:561px) and (max-width:900px){.pl-t{font-size:.95rem}.pl-t tbody th small{font-size:.8rem}}
+
+/* phase 2: a visible heading for the records tables (the table head is hidden when rows stack) */
+.pl-h4{font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;color:var(--sienna);margin:14px 0 0}
