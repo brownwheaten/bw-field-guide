@@ -15,6 +15,7 @@
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="stylesheet" href="vendor/leaflet.css">
 <link rel="stylesheet" href="style.css?v=7">
+<link rel="stylesheet" href="places.css?v=1">
 </head>
 <body>
 
@@ -111,6 +112,11 @@
       </div>
     </section>
 
+    <!-- PLACES (phase 1; code in places.js, loaded when the tab opens) -->
+    <section id="v-places" class="view places" hidden>
+      <div id="placesRoot"><div class="card"><p class="muted">Loading Places…</p></div></div>
+    </section>
+
     <!-- LOG -->
     <section id="v-log" class="view" hidden>
       <div class="card">
@@ -157,6 +163,7 @@
   <nav class="tabs">
     <button data-v="today" class="on">Today</button>
     <button data-v="map">Map</button>
+    <button data-v="places">Places</button>
     <button data-v="log">Log</button>
     <button data-v="fu">Follow-ups <span id="fuBadge" class="badge" hidden></span></button>
     <button data-v="more">More</button>
@@ -280,6 +287,6 @@
 <div id="toast" class="toast" role="status" hidden></div>
 
 <script src="vendor/leaflet.js"></script>
-<script src="app.js?v=10"></script>
+<script src="app.js?v=11"></script>
 </body>
 </html>

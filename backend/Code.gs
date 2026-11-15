@@ -12,6 +12,8 @@
  *   SHEET_ID        optional  B+W Field Notes (responses) sheet; captures are mirrored to a "Guide captures" tab
  *   BOOKING_URL     optional  private appointment-schedule link, used only by "Send booking link" (never put it in the repo)
  *   PUSH_URL        optional  push helper (Cloud Run) URL; PUSH_SECRET its shared secret; PUSH_SUBS is written by the app
+ *   PLACES_FOLDER_ID optional Drive folder holding the Places snapshot files (places_*.json.gz). If unset, the first folder named
+ *                             "B+W Places snapshots" in your Drive is used and its ID saved here.
  */
 
 const P = PropertiesService.getScriptProperties();
@@ -61,7 +63,32 @@ const ACTIONS = {
   testPush: () => push_('Field Guide test', 'Buzz works on this device. Real buzzes only come weekdays 10–6.', { force: true, tag: 'test' }),
   getFieldWalks: () => getFieldWalks_(),
   pushStatus: () => ({ configured: !!P.getProperty('PUSH_URL'), devices: subs_().map(s => s.device) }),
+  placesList: () => placesList_(),
+  placesFile: (d) => placesFile_(d),
 };
+
+// ---------- Places (phase 1): snapshot files from Drive. Read-only; the files are built by bw_out/tools/places_export.
+function placesFolder_() {
+  const id = P.getProperty('PLACES_FOLDER_ID');
+  if (id) { try { return DriveApp.getFolderById(id); } catch (e) { } }
+  const it = DriveApp.getFoldersByName('B+W Places snapshots');
+  if (!it.hasNext()) throw new Error('places_folder_missing');
+  const f = it.next(); P.setProperty('PLACES_FOLDER_ID', f.getId());
+  return f;
+}
+function placesList_() {
+  const out = []; const it = placesFolder_().getFiles();
+  while (it.hasNext()) { const f = it.next(); if (/^places_[A-Za-z0-9_]+\.json\.gz$/.test(f.getName())) out.push({ name: f.getName(), size: f.getSize(), updated: f.getLastUpdated().toISOString() }); }
+  return { files: out };
+}
+function placesFile_(d) {
+  const name = String(d.name || '');
+  if (!/^places_[A-Za-z0-9_]+\.json\.gz$/.test(name)) throw new Error('bad_name');
+  const it = placesFolder_().getFilesByName(name);
+  if (!it.hasNext()) throw new Error('places_file_missing: ' + name);
+  const f = it.next();
+  return { name, updated: f.getLastUpdated().toISOString(), size: f.getSize(), b64: Utilities.base64Encode(f.getBlob().getBytes()) };
+}
 
 // ---------- helpers ----------
 function json_(o) {
