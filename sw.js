@@ -1,6 +1,6 @@
 // B+W Field Guide service worker: app shell offline, area tiles and map tiles cached as you go, backend always live.
-const V = 'bwfg-v1.6.1';
-const SHELL = ['./', 'index.html', 'style.css?v=7', 'places.css?v=2', 'app.js?v=12', 'places-core.js?v=2', 'places.js?v=2', 'data.enc', 'manifest.webmanifest', 'icon-192.png', 'icon-180.png', 'card-qr.png',
+const V = 'bwfg-v1.9.1';
+const SHELL = ['./', 'index.html', 'style.css?v=7', 'places.css?v=6', 'app.js?v=16', 'places-core.js?v=6', 'places-records.js?v=6', 'places-work.js?v=6', 'places.js?v=6', 'data.enc', 'manifest.webmanifest', 'icon-192.png', 'icon-180.png', 'card-qr.png',
   'vendor/leaflet.css', 'vendor/leaflet.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => ![V, 'tiles', 'areas'].includes(k)).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
@@ -8,6 +8,8 @@ const put = (name, req, res) => { if (res && (res.ok || res.type === 'opaque')) 
 self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
   if (e.request.method !== 'GET' || u.hostname.endsWith('script.google.com') || u.hostname.endsWith('googleusercontent.com')) return;
+  // Places snapshot files are never cached by the service worker: the app keeps its own encrypted, versioned copies (sha256 against the meta)
+  if (u.pathname.endsWith('.json.gz')) return;
   if (u.hostname === 'tile.openstreetmap.org') {
     e.respondWith(caches.match(e.request, { ignoreVary: true }).then(hit => hit || fetch(e.request).then(r => put('tiles', e.request, r))));
     return;

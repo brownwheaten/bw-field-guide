@@ -35,6 +35,7 @@ function doPost(e) {
     if (!fn) return json_({ ok: false, error: 'unknown_action' });
     return json_(Object.assign({ ok: true }, fn(req.data || {})));
   } catch (err) {
+    if (req.action === 'placesGeocode') { console.error('placesGeocode failed'); return json_({ ok: false, error: 'geocode_failed' }); }   // never log or echo the typed address
     console.error(req.action, err);
     return json_({ ok: false, error: String(err && err.message || err) });
   }
@@ -67,6 +68,7 @@ const ACTIONS = {
   pushStatus: () => ({ configured: !!P.getProperty('PUSH_URL'), devices: subs_().map(s => s.device) }),
   placesList: () => placesList_(),
   placesFile: (d) => placesFile_(d),
+  placesGeocode: (d) => placesGeocode_(d),
 };
 
 // ---------- Places (phase 1): snapshot files from Drive. Read-only; the files are built by bw_out/tools/places_export.
@@ -114,6 +116,69 @@ function placesFile_(d) {
   if (!fs.length) throw new Error('places_file_missing: ' + name);
   const f = fs.sort(placesNewer_)[0];
   return { name, updated: f.getLastUpdated().toISOString(), size: f.getSize(), copies: fs.length, b64: Utilities.base64Encode(f.getBlob().getBytes()) };
+}
+
+// ---------- Places (phase 2c): address search. Read-only.
+// Philadelphia: the City's property file in the warehouse (vw_phl_opa_properties: house number, street, parcel location; about 50 MB a lookup).
+// Elsewhere: the U.S. Census Bureau's public geocoder (no key, no account; the address typed is sent to the Census Bureau). New Jersey's
+// MOD-IV file is not used: it carries no coordinates (and a census tract on under 1% of rows) and costs about 2.4 GB a lookup.
+// Returns { hits: [{lat, lon, matched, exact, near}], source }. No new permission: BigQuery and external requests are already granted.
+const GEO_TYPES_ = { STREET: 'ST', ST: 'ST', AVENUE: 'AVE', AVE: 'AVE', AV: 'AVE', ROAD: 'RD', RD: 'RD', BOULEVARD: 'BLVD', BLVD: 'BLVD', LANE: 'LN', LN: 'LN',
+  DRIVE: 'DR', DR: 'DR', PLACE: 'PL', PL: 'PL', TERRACE: 'TER', TER: 'TER', COURT: 'CT', CT: 'CT', WAY: 'WAY', PIKE: 'PIKE', SQUARE: 'SQ', SQ: 'SQ', PARKWAY: 'PKWY', PKWY: 'PKWY' };
+const GEO_DIRS_ = { NORTH: 'N', N: 'N', SOUTH: 'S', S: 'S', EAST: 'E', E: 'E', WEST: 'W', W: 'W' };
+function placesParseAddress_(q) {
+  const raw = String(q || '').slice(0, 200);
+  const parts = raw.split(',').map(x => x.trim()).filter(Boolean);
+  let first = (parts[0] || '').toUpperCase().replace(/[.#]/g, ' ').replace(/\s+/g, ' ').trim();
+  first = first.replace(/\s(?:\d+(?:ST|ND|RD|TH)\s)?(?:STE|SUITE|FL|FLOOR|UNIT|APT|REAR)\b.*$/, '');
+  const m = first.match(/^(\d+)[A-Z]?(?:\s*-\s*\d+[A-Z]?)?\s+(.+)$/); if (!m) return null;
+  let toks = m[2].split(' ');
+  const rest = parts.slice(1).join(' ').toUpperCase();
+  const zip = (raw.match(/\b(\d{5})(?:-\d{4})?\s*$/) || [])[1] || null;
+  let dir = null; if (toks.length > 1 && GEO_DIRS_[toks[0]] && !(toks.length === 2 && GEO_TYPES_[toks[1]])) { dir = GEO_DIRS_[toks[0]]; toks = toks.slice(1); }
+  let type = null; if (toks.length > 1 && GEO_TYPES_[toks[toks.length - 1]]) { type = GEO_TYPES_[toks[toks.length - 1]]; toks = toks.slice(0, -1); }
+  let name = toks.join(' ').replace(/\b0*(\d+)\s?(ST|ND|RD|TH)\b/, '$1$2');
+  if (/^\d+$/.test(name)) { const n = +name; name = n + ({ 1: 'ST', 2: 'ND', 3: 'RD' }[n % 100 >= 11 && n % 100 <= 13 ? 0 : n % 10] || 'TH'); }
+  const city = rest.replace(/\b\d{5}(?:-\d{4})?\b/, '').replace(/\b(PA|PENNSYLVANIA|NJ|NEW JERSEY|NY|DE|MD|MA|CT|RI)\b/g, '').trim();
+  const phl = (!rest && !zip) || /\bPHILA(DELPHIA)?\b/.test(rest) || (zip && /^191\d\d$/.test(zip));
+  return { hn: +m[1], dir, name, type, zip, city, phl, raw };
+}
+function placesBq_(sql, params) {
+  const req = { query: sql, useLegacySql: false, parameterMode: 'NAMED', queryParameters: params || [], timeoutMs: 20000 };
+  let res = BigQuery.Jobs.query(req, BQ_PROJECT());
+  const jobId = res.jobReference.jobId, loc = res.jobReference.location; let n = 0;
+  while (!res.jobComplete && n++ < 50) { Utilities.sleep(500); res = BigQuery.Jobs.getQueryResults(BQ_PROJECT(), jobId, { location: loc, timeoutMs: 10000 }); }
+  if (!res.jobComplete) return null;
+  const fields = (res.schema && res.schema.fields) || [];
+  return (res.rows || []).map(r => { const o = {}; r.f.forEach((c, i) => { o[fields[i].name] = c.v; }); return o; });
+}
+function placesGeocode_(d) {
+  const a = placesParseAddress_(d.q); if (!a) return { hits: [], source: '', error: 'not_an_address' };
+  if (a.phl) {
+    const params = [p_('hn', 'INT64', a.hn), p_('nm', 'STRING', a.name)];
+    let where = 'street_name = @nm AND lat IS NOT NULL';
+    if (a.dir) { where += ' AND IFNULL(street_direction, "") = @dir'; params.push(p_('dir', 'STRING', a.dir)); }
+    if (a.type) { where += ' AND street_designation = @ty'; params.push(p_('ty', 'STRING', a.type)); }
+    // exact number first, else the nearest number on the same side within 30
+    // review M5: placesBq_ waits up to 45 s and says so when the warehouse is slow (bq_ returns no rows after 15 s, which read as "not found")
+    const rows = placesBq_('SELECT location, lat, lon, house_no, street_direction, street_name, street_designation, parcel_number, ABS(house_no - @hn) d FROM ' + T('vw_phl_opa_properties') +
+      ' WHERE ' + where + ' AND MOD(house_no, 2) = MOD(@hn, 2) AND ABS(house_no - @hn) <= 30 ORDER BY d, location LIMIT 40', params);
+    if (rows === null) return { hits: [], source: '', error: 'warehouse_timeout' };
+    const best = {};
+    rows.forEach(r => { const k = [r.street_direction || '', r.street_name, r.street_designation || ''].join(' '); if (!best[k]) best[k] = r; });
+    const hits = Object.keys(best).map(k => { const r = best[k]; return { lat: Number(r.lat), lon: Number(r.lon), matched: (Number(r.d) === 0 ? r.location : a.hn + ' ' + k.trim() + ' (near ' + r.location + ')') + ', Philadelphia', exact: Number(r.d) === 0, near: Number(r.d), pn: r.parcel_number || null }; });
+    if (hits.length) return { hits: hits.slice(0, 5), source: 'the City of Philadelphia property file (OPA) in the B+W warehouse' };
+    if (!d.fallback && !a.zip && !a.city) return { hits: [], source: 'the City of Philadelphia property file (OPA)', note: 'not found in Philadelphia; add the town and state to search elsewhere' };
+  }
+  // the Census Bureau geocoder: free and public, no key
+  const url = 'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=' + encodeURIComponent(a.raw);
+  // review M5: the request URL carries the typed address, so a failure is caught here and never logged or returned with it
+  let r;
+  try { r = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true }); } catch (e) { console.error('placesGeocode: census geocoder unreachable'); return { hits: [], source: '', error: 'census_unreachable' }; }
+  if (r.getResponseCode() !== 200) { console.error('placesGeocode: census geocoder HTTP ' + r.getResponseCode()); return { hits: [], source: '', error: 'census_unavailable' }; }
+  let j; try { j = JSON.parse(r.getContentText()); } catch (e) { return { hits: [], source: '', error: 'census_unavailable' }; }
+  const ms = (j.result && j.result.addressMatches) || [];
+  return { hits: ms.slice(0, 5).map(x => ({ lat: Number(x.coordinates.y), lon: Number(x.coordinates.x), matched: x.matchedAddress, exact: true, near: 0 })), source: 'the U.S. Census Bureau geocoder (public, no key)' };
 }
 
 // ---------- helpers ----------

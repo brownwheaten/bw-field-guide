@@ -69,3 +69,16 @@
 .pl-gps.warn{color:var(--warn)}
 .pl-chip[title]{cursor:pointer}
 @media (min-width:561px) and (max-width:900px){.pl-t{font-size:.95rem}.pl-t tbody th small{font-size:.8rem}}
+
+/* phase 2: a visible heading for the records tables (the table head is hidden when rows stack) */
+.pl-h4{font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;color:var(--sienna);margin:14px 0 0}
+/* phase 2c: side by side, meeting-mode select */
+.pl-cmp th small{display:block;font-weight:400;color:var(--muted,#6b5d50);font-size:12px}
+.pl-cmp td.num{white-space:nowrap}
+.pl-tools select{font:inherit;padding:2px 4px;margin-left:4px}
+@media (min-width:561px) and (max-width:900px){.pl-cmp thead{display:table-header-group}.pl-cmp tr{display:table-row}.pl-cmp td,.pl-cmp th{display:table-cell}}
+.pl-cl{display:none}
+@media (max-width:560px){.pl-cl{display:block;color:var(--muted,#6b5d50);font-size:12px}.pl-cmp tr{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.pl-cmp td.num{white-space:normal;text-align:left}.pl-cmp td:nth-of-type(3){grid-column:1/-1;text-align:left}.pl-t.pl-cmp td:nth-of-type(3):not(:empty)::before{content:none}}
+
+.pl-alert{border-left:3px solid var(--warn,#a5452a);padding-left:8px;color:var(--warn,#a5452a)}
+.pl-meetwarn{font-size:.85rem;color:var(--muted,#6b5d50)}
