@@ -35,6 +35,7 @@ function doPost(e) {
     if (!fn) return json_({ ok: false, error: 'unknown_action' });
     return json_(Object.assign({ ok: true }, fn(req.data || {})));
   } catch (err) {
+    if (req.action === 'placesGeocode') { console.error('placesGeocode failed'); return json_({ ok: false, error: 'geocode_failed' }); }   // never log or echo the typed address
     console.error(req.action, err);
     return json_({ ok: false, error: String(err && err.message || err) });
   }
@@ -142,6 +143,15 @@ function placesParseAddress_(q) {
   const phl = (!rest && !zip) || /\bPHILA(DELPHIA)?\b/.test(rest) || (zip && /^191\d\d$/.test(zip));
   return { hn: +m[1], dir, name, type, zip, city, phl, raw };
 }
+function placesBq_(sql, params) {
+  const req = { query: sql, useLegacySql: false, parameterMode: 'NAMED', queryParameters: params || [], timeoutMs: 20000 };
+  let res = BigQuery.Jobs.query(req, BQ_PROJECT());
+  const jobId = res.jobReference.jobId, loc = res.jobReference.location; let n = 0;
+  while (!res.jobComplete && n++ < 50) { Utilities.sleep(500); res = BigQuery.Jobs.getQueryResults(BQ_PROJECT(), jobId, { location: loc, timeoutMs: 10000 }); }
+  if (!res.jobComplete) return null;
+  const fields = (res.schema && res.schema.fields) || [];
+  return (res.rows || []).map(r => { const o = {}; r.f.forEach((c, i) => { o[fields[i].name] = c.v; }); return o; });
+}
 function placesGeocode_(d) {
   const a = placesParseAddress_(d.q); if (!a) return { hits: [], source: '', error: 'not_an_address' };
   if (a.phl) {
@@ -150,19 +160,23 @@ function placesGeocode_(d) {
     if (a.dir) { where += ' AND IFNULL(street_direction, "") = @dir'; params.push(p_('dir', 'STRING', a.dir)); }
     if (a.type) { where += ' AND street_designation = @ty'; params.push(p_('ty', 'STRING', a.type)); }
     // exact number first, else the nearest number on the same side within 30
-    const rows = bq_('SELECT location, lat, lon, house_no, street_direction, street_name, street_designation, ABS(house_no - @hn) d FROM ' + T('vw_phl_opa_properties') +
+    // review M5: placesBq_ waits up to 45 s and says so when the warehouse is slow (bq_ returns no rows after 15 s, which read as "not found")
+    const rows = placesBq_('SELECT location, lat, lon, house_no, street_direction, street_name, street_designation, parcel_number, ABS(house_no - @hn) d FROM ' + T('vw_phl_opa_properties') +
       ' WHERE ' + where + ' AND MOD(house_no, 2) = MOD(@hn, 2) AND ABS(house_no - @hn) <= 30 ORDER BY d, location LIMIT 40', params);
+    if (rows === null) return { hits: [], source: '', error: 'warehouse_timeout' };
     const best = {};
     rows.forEach(r => { const k = [r.street_direction || '', r.street_name, r.street_designation || ''].join(' '); if (!best[k]) best[k] = r; });
-    const hits = Object.keys(best).map(k => { const r = best[k]; return { lat: Number(r.lat), lon: Number(r.lon), matched: (Number(r.d) === 0 ? r.location : a.hn + ' ' + k.trim() + ' (near ' + r.location + ')') + ', Philadelphia', exact: Number(r.d) === 0, near: Number(r.d) }; });
+    const hits = Object.keys(best).map(k => { const r = best[k]; return { lat: Number(r.lat), lon: Number(r.lon), matched: (Number(r.d) === 0 ? r.location : a.hn + ' ' + k.trim() + ' (near ' + r.location + ')') + ', Philadelphia', exact: Number(r.d) === 0, near: Number(r.d), pn: r.parcel_number || null }; });
     if (hits.length) return { hits: hits.slice(0, 5), source: 'the City of Philadelphia property file (OPA) in the B+W warehouse' };
     if (!d.fallback && !a.zip && !a.city) return { hits: [], source: 'the City of Philadelphia property file (OPA)', note: 'not found in Philadelphia; add the town and state to search elsewhere' };
   }
   // the Census Bureau geocoder: free and public, no key
   const url = 'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=' + encodeURIComponent(a.raw);
-  const r = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
-  if (r.getResponseCode() !== 200) throw new Error('census_geocoder_' + r.getResponseCode());
-  const j = JSON.parse(r.getContentText());
+  // review M5: the request URL carries the typed address, so a failure is caught here and never logged or returned with it
+  let r;
+  try { r = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true }); } catch (e) { console.error('placesGeocode: census geocoder unreachable'); return { hits: [], source: '', error: 'census_unreachable' }; }
+  if (r.getResponseCode() !== 200) { console.error('placesGeocode: census geocoder HTTP ' + r.getResponseCode()); return { hits: [], source: '', error: 'census_unavailable' }; }
+  let j; try { j = JSON.parse(r.getContentText()); } catch (e) { return { hits: [], source: '', error: 'census_unavailable' }; }
   const ms = (j.result && j.result.addressMatches) || [];
   return { hits: ms.slice(0, 5).map(x => ({ lat: Number(x.coordinates.y), lon: Number(x.coordinates.x), matched: x.matchedAddress, exact: true, near: 0 })), source: 'the U.S. Census Bureau geocoder (public, no key)' };
 }

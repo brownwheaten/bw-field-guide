@@ -241,9 +241,10 @@
     // the name shown for the top owner: the raw id of the first parcel under that normalized id, if that owner holds 3+ parcels citywide
     let topName = null; if (topOn !== null) for (const i of idx) if (c.o[i] + c.ond[i] === topOn) { topName = Ly.data.owner_names[c.o[i]] || null; if (topName) break; }
     vals.sort((a, b) => b - a); const k10 = Math.max(1, Math.ceil(vals.length * 0.10)); const topVal = vals.slice(0, k10).reduce((a, b) => a + b, 0);
+    // [name, parcels here, index of one of them] (the index gives the City property site link; individuals' names are not in the file)
     const owners = [...onN.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, n]) => {
-      let nm = null; for (const i of idx) if (c.o[i] + c.ond[i] === k) { nm = Ly.data.owner_names[c.o[i]] || null; if (nm) break; } return [nm, n]; });
-    return { kind: 'property', as_of: Ly.data.as_of, n: idx.length, owners_raw: o.size, owners: on.size, owners_print: String(Math.round(on.size / 10) * 10),
+      let nm = null, ex = null; for (const i of idx) if (c.o[i] + c.ond[i] === k) { if (ex === null) ex = i; nm = Ly.data.owner_names[c.o[i]] || null; if (nm) break; } return [nm, n, ex]; });
+    return { kind: 'property', as_of: Ly.data.as_of, n: idx.length, owners_raw: o.size, owners: on.size, owners_print: (Math.round(on.size / 10) * 10).toLocaleString('en-US'),
       top_owner_n: topN, top_owner: topName, top_owners: owners, nonres: nr, nonres_owners: onNR.size, nonres_value: nrVal,
       gates: { S5: idx.length >= 50 ? 'pass' : `FAIL: ${idx.length} properties (needs 50)`, G5_owner: idx.length && topN / idx.length > 0.5 ? `FAIL: one owner name holds ${topN}` : 'pass',
         G5_value: nrVal && topVal / nrVal > 0.5 ? `FAIL: ${k10} of ${vals.length} non-residential properties hold ${Math.round(topVal / nrVal * 100)}% of the value` : 'pass' },
@@ -290,7 +291,9 @@
     for (let i = 0; i < R.L.sba.n; i++) { if (c.mb[i] || c.fy[i] < 2020) continue; n++; if (c.y[i] === null) u++; }
     return { n, unplaced: u, share: n ? u / n : 0 };
   }
-  const Records = { partRx, permitsSay, permitSayOK, unplacedSbaShare, decodeCols, load, select, summarize, permits, licenses, loans, grants, property, sales, steady, ytdWindow, directionAllowed, streetIds, addrText, ymd, dayOf, VERSION: '2.1.0' };
+  /** the City property site page for a parcel (OPA account number, 9 digits); no owner name is ever part of the address */
+  const opaUrl = (pn) => 'https://property.phila.gov/?p=' + String(pn).padStart(9, '0');
+  const Records = { opaUrl, partRx, permitsSay, permitSayOK, unplacedSbaShare, decodeCols, load, select, summarize, permits, licenses, loans, grants, property, sales, steady, ytdWindow, directionAllowed, streetIds, addrText, ymd, dayOf, VERSION: '2.1.0' };
   if (typeof module !== 'undefined' && module.exports) module.exports = Records;
   else root.BWPlacesRecords = Records;
 })(typeof window !== 'undefined' ? window : globalThis);

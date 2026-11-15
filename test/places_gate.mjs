@@ -134,7 +134,7 @@ if (fs.existsSync(path.join(snapDir, 'places_pts_meta.json.gz'))) {
       if (p.file_max) rchk(b, dir, 'permits.file_max', S.permits.as_of, p.file_max);
       // the printed claim 3 (rule S1): lead and support as the packet printed them
       const F = JSON.parse(fs.readFileSync(path.join(pktDir, dir, 'figures.json')));
-      const c3 = Object.values(F.text || {}).flat().find(x => x && typeof x === 'object' && x.slot === 'F7.3' && x.rule === 'S1');
+      const c3 = Object.values(F.text || {}).flat().find(x => x && typeof x === 'object' && x.slot === 'F7.3' && /^S1\b/.test(x.rule || ''));
       if (c3) { const sy = Rec.permitsSay(S.permits, `${F.meta.street} addresses`); rchk(b, dir, 'permits.printed_claim3', [sy.lead, sy.support], [c3.lead, c3.support]); }
     }
     if (RI.food_licenses_active) {
@@ -330,6 +330,16 @@ report.final = { compared: 0, matched: 0, mismatched: 0, checks: [] };
       const overl = Object.values(by).some(rs => rs.sort((x, y) => x[0] - y[0]).some((r, i) => i && r[0] <= rs[i - 1][1])); if (overl) fchk(a.id, 'no overlapping parts', overl, false); }
     fchk('areas', 'no overlapping address parts anywhere', areas.filter(x => x.addr).every(a => { const by = {}; for (const [st, lo, hi] of a.addr.parts) (by[st] ||= []).push([lo, hi]); return Object.values(by).every(rs => rs.sort((x, y) => x[0] - y[0]).every((r, i) => !i || r[0] > rs[i - 1][1])); }), true);
   }
+  // review H3 and DW's owner rule (Nov 15): the records files carry their own sha256s; OPA numbers line up with parcels; owner names are firms or the private label
+  if (fs.existsSync(path.join(snapDir, 'places_pts_meta.json.gz'))) {
+    const crypto = require('crypto'); const pm = gz('places_pts_meta.json.gz');
+    for (const f of pm.files) fchk('pts_meta', 'sha256 ' + f.file, f.sha256, fs.existsSync(path.join(snapDir, f.file)) ? crypto.createHash('sha256').update(fs.readFileSync(path.join(snapDir, f.file))).digest('hex') : 'missing');
+    const PP = gz('places_pts_parcels.json.gz');
+    if (fs.existsSync(path.join(snapDir, 'places_pts_pn.json.gz'))) fchk('pts_pn', 'one OPA number per parcel', gz('places_pts_pn.json.gz').pn.length, PP.n);
+    const fe2 = ref('places_gate_final_expected.json') || {}; const on = Object.values(PP.owner_names || {});
+    if (fe2.owner_names) { fchk('owners', 'owner names listed', on.length, fe2.owner_names.listed);
+      fchk('owners', 'non-individual names kept (all others read the private label)', on.filter(x => x !== fe2.owner_names.label).length, fe2.owner_names.kept_non_individual); }
+  }
   // 7. versioned files (defect 1): every listed file carries the sha256 of the file in this folder; the meta carries a rev
   const crypto = require('crypto'); const meta = gz('places_meta.json.gz');
   fchk('meta', 'rev present', typeof meta.rev === 'string' && meta.rev.length === 12, true);
@@ -344,6 +354,10 @@ report.final = { compared: 0, matched: 0, mismatched: 0, checks: [] };
     const missing = Object.keys(counties).filter(c => !c.startsWith('09') && !CC[c]);
     fchk('countycard', 'every non-Connecticut comparator county has a county card', missing, []);
     for (const [c, k] of Object.entries(CC)) { const bad = (k.sectors || []).filter(s => s.emp === 0); if (bad.length) { fchk('countycard', c + ' withheld sectors shown as withheld, never 0', bad.length, 0); break; } }
+    // review H1: no sector of 50+ establishments reads 0 jobs or blank (BLS withholds none that size); a gap row carries an earlier year's figure
+    fchk('countycard', 'no 50+ establishment sector shown as 0 or blank this year', Object.values(CC).reduce((a, k) => a + (k.sectors || []).filter(s => s.est >= 50 && !s.gap && !(s.emp > 0)).length, 0), 0);
+    // a gap row shows an earlier year's figure (labeled with that year) or, with neither year held in the warehouse (88 rows), reads "not in the file": never 0
+    fchk('countycard', 'every gap row carries an earlier year and a figure, or none', Object.values(CC).reduce((a, k) => a + (k.sectors || []).filter(s => s.gap && !(s.emp === null || (s.y < k.qcew_year && s.emp > 0))).length, 0), 0);
   }
   console.log(`final pass: ${report.final.compared} checks, ${report.final.matched} match, ${report.final.mismatched} unexplained mismatch`);
 }

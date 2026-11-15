@@ -51,3 +51,9 @@ what's opening and closing, property and money, food access and a small health s
 - `backend/Code.gs`: the read-only `placesGeocode` action (the City property file in the warehouse for Philadelphia; the Census Bureau's public
   geocoder, no key, elsewhere).
 - `test/places_gate.mjs`: a "final pass" block checks the fixes against references kept outside the repo.
+- Combined review fixes (app 1.9.1): the app checks the snapshot file list against the files it downloads and shows a banner and withholds
+  records when Drive serves an older list; a saved copy is kept when a fetch fails; meeting mode shows no falling run, median deed price or
+  signed change and keeps one-line warnings; county sectors missing from the latest BLS file show the year before, labeled, never "withheld".
+- Owner names: only non-individual owners (firms, institutions, government) are named; individuals read "Private owner (individual)", with
+  the parcel count kept. Names are stripped when the snapshot is built, so they never reach a device. Each listed owner and each Philadelphia
+  address links to the City's property site by OPA account number (no name in the link).
